@@ -1,0 +1,62 @@
+[package]
+name = "feebot"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.79"
+description = "OTC (otcdesks.cash) launcher reward-farming bot: Lighthouse-gated entry/exit, reward selling, ATA incinerator"
+
+[[bin]]
+name = "feebot"
+path = "src/main.rs"
+
+[dependencies]
+# Solana — Agave 2.x (caret: подтянет свежую 2.x). Бампать вместе при апгрейде.
+solana-sdk = "2.1"
+solana-client = "2.1"
+solana-account-decoder = "2.1"
+# no-entrypoint: мы библиотека, а не ончейн-программа — не тащим символ entrypoint
+# (иначе LNK2005: multiply defined symbol при линковке).
+spl-token = { version = "6.0.0", features = ["no-entrypoint"] }
+spl-token-2022 = { version = "6.0.0", features = ["no-entrypoint"] }
+spl-associated-token-account = { version = "6.0.0", features = ["no-entrypoint"] }
+
+# Async / runtime
+tokio = { version = "1.40.0", features = ["full"] }
+tokio-stream = "0.1.16"
+
+# gRPC — чтение шредов через Raiden Pulse (raiden_binary.proto).
+# Версии ПИНИМ: tonic 0.14 перенёс кодген в tonic-prost-build и ломает build.rs.
+tonic = "0.12.3"
+prost = "0.13.3"
+prost-types = "0.13.3"
+
+# HTTP (RPC relays, Jupiter, OTC API)
+reqwest = { version = "0.12.7", features = ["json", "gzip", "rustls-tls"], default-features = false }
+
+# Serde / encoding
+serde = { version = "1.0.210", features = ["derive"] }
+serde_json = "1.0.128"
+toml = "0.8.19"
+bincode = "1.3.3"
+bs58 = "0.5.1"
+base64 = "0.22.1"
+
+# Misc
+anyhow = "1.0.89"
+thiserror = "1.0.64"
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+once_cell = "1.20.1"
+rand = "0.8.5"
+clap = { version = "4.5.17", features = ["derive"] }
+
+[build-dependencies]
+# protox компилит .proto на чистом Rust — protoc ставить не нужно (важно на Windows).
+tonic-build = "0.12.3"
+protox = "0.7.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

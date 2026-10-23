@@ -1,0 +1,8 @@
+/target
+config.toml
+*.log
+/id*.json
+/*.json
+/research
+/proto
+/config

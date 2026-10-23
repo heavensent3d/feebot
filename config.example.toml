@@ -1,0 +1,132 @@
+# ───────── feebot config (пример) ─────────
+# Скопируй в config.toml и подставь свои значения.
+# По умолчанию strategy.dry_run = true — бот ничего не шлёт, только логирует.
+
+[rpc]
+# Лучше платный RPC с низкой задержкой (Helius/Triton/QuickNode).
+http = "https://api.mainnet-beta.solana.com"
+ws = "wss://api.mainnet-beta.solana.com"
+# send_http = "https://your-fast-send-endpoint"   # опц., для рассылки tx
+commitment = "processed"
+
+[wallet]
+# Путь к keypair-файлу (как id.json у solana-keygen). Ключ в конфиг НЕ пишем.
+keypair_path = "C:/Users/you/.config/solana/feebot.json"
+
+# Релеи = быстрые гейтвеи для отправки tx (не общий mempool).
+# ПЕРВЫЙ в списке используется для ВХОДА (buy шлётся ровно один раз на него).
+# Все релеи получают ВЫХОД (sell веерится, приземляется одна копия).
+#
+# Astralane: ключ в URL (api-key=), регионы fr/ams/ny/jp/sg/la/lim/lon/edge.
+# tip — отдельной инструкцией на astra…-аккаунт (relay добавит сам), мин ~10000,
+# в бою обычно 100k–300k. mev-protect можно включить и в URL (&mev-protect=true),
+# и флагом mev_protect=true ниже.
+[[relays]]
+name = "astralane-fr"
+url = "https://fr.gateway.astralane.io/iris?api-key=YOUR_ASTRALANE_KEY"
+kind = "astralane"
+tip_lamports = 200000
+mev_protect = false
+# tip_account = "astra4uejePWneqNaJKuFFA8oonqCE1sqF6b45kDMZm"  # опц., иначе случайный
+
+# Nozomi (Temporal): ключ в URL (?c=), tip обязателен, мин 0.001 SOL = 1_000_000
+# (ниже молча дропается — бот сам поднимет до минимума). tip на noz…-аккаунт.
+# [[relays]]
+# name = "nozomi"
+# url = "https://nozomi.temporal.xyz/?c=YOUR_NOZOMI_KEY"   # или fra2/ams1-хост; dedicated путь /api/sendTransaction2?c=KEY
+# kind = "nozomi"
+# tip_lamports = 1000000
+
+# Constant-K: staked sendTransaction (SWQoS), БЕЗ tip. Нужен план Operator+.
+# Формат: https://staked-rpc-<region>.constant-k.com/?api-key=KEY  (newyork/frankfurt/amsterdam)
+# [[relays]]
+# name = "constant-k"
+# url = "https://staked-rpc-frankfurt.constant-k.com/?api-key=YOUR_KEY"
+# kind = "constant-k"
+# tip_lamports = 0
+# Про Neon Zero (гейт latency-to-leader, план Nexus): https://neon-rpc-<region>.constant-k.com/?api-key=KEY
+# Он пропускает ~25% сендов, но из них ~77% в slot+0 — хорош как ДОП. релей для
+# спам-выхода (остальные релеи шлют всегда), плохо если нужно гарантированно отправить.
+
+# Jito (bundle) — для надёжности выхода:
+# [[relays]]
+# name = "jito"
+# url = "https://mainnet.block-engine.jito.wtf/api/v1/bundles"
+# kind = "jito"
+# tip_lamports = 1000000
+#
+# ПОДСКАЗКА: запусти `feebot bench` — замерит land-latency по всем релеям
+# твоим ключом и покажет, что быстрее (Nozomi / Astralane / Constant-K).
+
+[strategy]
+buy_sol = 1.5
+sell_fraction = 1.0
+buy_cu_price = 5000000        # micro-lamports/CU на вход (как у разобранного бота)
+buy_cu_limit = 120000
+sell_cu_price = 136000        # на спам-выход
+sell_cu_limit = 120000
+slippage_bps = 1500
+exit_spam_slots = 40          # сколько слотов спамить выход
+poll_ms = 400
+max_concurrent_positions = 3
+dry_run = true                # ВЫКЛЮЧАТЬ только после сверки layout'ов!
+lighthouse_exit_gate = true
+exit_gate_epsilon = 1         # на сколько должен вырасти баланс стока (base units)
+entry_gate = true             # Lighthouse-гейт «мой ATA пуст» → защита от двойной покупки
+fanout_entry = false          # веерить вход на все релеи (безопасно при entry_gate=true)
+# nonce_account = "<durable nonce pubkey>"   # опц., для долгоживущего выхода (feebot init-nonce)
+# tip на вход/выход задаётся per-relay (см. [[relays]]), а не здесь.
+
+[filters]
+max_market_cap_usd = 15000    # лоукапы 2–15k (капа из snapshot.marketCap)
+min_market_cap_usd = 2000
+min_volume_24h_usd = 4000     # есть объём → раунд придёт быстро, не сольют пока ждём
+min_liquidity_usd = 2000      # чтобы монету и награду реально можно было продать
+min_pending_reward_sol = 0.06 # раунд близко (в /api/coins пока НЕ приходит — не фильтрует)
+max_pending_reward_sol = 0.10
+# EV-гейт: наша доля раздачи от квалифицированного флоата.
+min_expected_ev_sol = 0.0     # режем вход, если расчётный EV ниже (0 = не входить в минус)
+qualified_float_pct = 20.0    # ДОПУЩЕНИЕ: % капы = конкурирующий флоат (точное — из он-чейн холдеров)
+round_payout_sol = 0.1        # сколько SOL раздаётся за раунд (= порог раунда)
+assumed_rounds_per_hold = 1.0 # сколько раундов рассчитываем собрать за удержание
+coin_drawdown_frac = 0.08     # ожидаемая просадка на round-trip монеты (доля от buy_sol)
+round_fees_sol = 0.01         # комиссии+tip за цикл
+reward_mint_denylist = []
+reward_mint_allowlist = []    # пусто = любой reward-сток
+
+[jupiter]
+quote_url = "https://quote-api.jup.ag/v6/quote"
+swap_url = "https://quote-api.jup.ag/v6/swap"
+slippage_bps = 3000           # стоки неликвидные — шире
+min_reward_sol = 0.01         # ниже — считаем dust, не продаём
+
+[incinerator]
+enabled = false
+interval_secs = 1800
+only_zero_balance = true      # закрывать только пустые
+keep_mints = []               # mint'ы, которые не трогать
+max_per_run = 20
+
+[otc]
+api_base = "https://otcdesks.cash"
+oracle = "api"
+
+# Чтение шредов через Raiden Pulse (decoded shreds over gRPC).
+# Авторизация по IP (allowlist в дашборде Raiden), токена нет. Порт 16000 plaintext.
+# Если все account_* пусты — следим за reward-кошельком OTC по умолчанию.
+[shreds]
+enabled = false
+endpoint = "http://fra.pulse.raiden.wtf:16000"   # FRA / AMS / NYC
+filter_name = "otc"
+account_include = []       # например ["2k5hrzuykwyTbUe8L7UriYAQhr5hijNLgBvEB4B9pP5y"]
+account_required = []
+account_exclude = []
+
+# Отчётность: подробный PnL по сделкам в Telegram + локальный JSONL-журнал.
+# Токен бота — у @BotFather, chat_id — свой (напиши боту и глянь getUpdates).
+[telegram]
+enabled = true
+bot_token = ""
+chat_id = ""
+summary_every_secs = 3600        # периодическая сводка (0 = выкл)
+journal_path = "feebot-journal.jsonl"   # локальный журнал (пусто = не писать)

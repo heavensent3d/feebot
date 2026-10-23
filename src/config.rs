@@ -1,0 +1,478 @@
+//! Конфиг бота (TOML). См. config.example.toml.
+
+use anyhow::{Context, Result};
+use serde::Deserialize;
+use std::path::Path;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Config {
+    pub rpc: RpcConfig,
+    pub wallet: WalletConfig,
+    #[serde(default)]
+    pub relays: Vec<RelayConfig>,
+    pub strategy: StrategyConfig,
+    #[serde(default)]
+    pub filters: FilterConfig,
+    #[serde(default)]
+    pub incinerator: IncineratorConfig,
+    #[serde(default)]
+    pub jupiter: JupiterConfig,
+    #[serde(default)]
+    pub otc: OtcConfig,
+    #[serde(default)]
+    pub shreds: ShredsConfig,
+    #[serde(default)]
+    pub telegram: TelegramConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RpcConfig {
+    /// Основной HTTP RPC (лучше платный: Helius/Triton/QuickNode).
+    pub http: String,
+    /// WebSocket для подписок (logsSubscribe/accountSubscribe).
+    pub ws: String,
+    /// Отдельный «быстрый» RPC только для рассылки tx (может совпадать с http).
+    #[serde(default)]
+    pub send_http: Option<String>,
+    #[serde(default = "default_commitment")]
+    pub commitment: String,
+}
+
+fn default_commitment() -> String {
+    "processed".into()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WalletConfig {
+    /// Путь к keypair-файлу (как у solana-keygen). Ключ НИКОГДА не хранится в конфиге.
+    pub keypair_path: String,
+}
+
+/// Куда ещё, помимо основного RPC, веерно слать транзакции.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RelayConfig {
+    pub name: String,
+    pub url: String,
+    /// "jsonrpc" (обычный sendTransaction), "jito" (sendBundle) или "astralane".
+    #[serde(default = "default_kind")]
+    pub kind: String,
+    /// Tip в lamports (для jito/astralane/nozomi и т.п.). 0 = без tip.
+    #[serde(default)]
+    pub tip_lamports: u64,
+    /// Явный tip-аккаунт; если пусто — для jito/astralane берём случайный из
+    /// зашитого списка подходящих адресов.
+    #[serde(default)]
+    pub tip_account: Option<String>,
+    /// Только для kind="astralane": добавить 3-й параметр {mevProtect:true}.
+    /// (альтернатива — &mev-protect=true прямо в URL.)
+    #[serde(default)]
+    pub mev_protect: bool,
+    #[serde(default)]
+    pub auth_header: Option<String>,
+}
+
+fn default_kind() -> String {
+    "jsonrpc".into()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StrategyConfig {
+    /// Размер входа в SOL (бот из разбора: 1.5–4 SOL).
+    pub buy_sol: f64,
+    /// Доля от выкупленных токенов, которую продаём на выходе (1.0 = всё).
+    #[serde(default = "one")]
+    pub sell_fraction: f64,
+    /// Priority fee (micro-lamports per CU) для buy.
+    #[serde(default = "default_buy_cu_price")]
+    pub buy_cu_price: u64,
+    #[serde(default = "default_buy_cu_limit")]
+    pub buy_cu_limit: u32,
+    /// Priority fee для спам-sell (разобранный бот гонял 1 и 136000).
+    #[serde(default = "default_sell_cu_price")]
+    pub sell_cu_price: u64,
+    #[serde(default = "default_sell_cu_limit")]
+    pub sell_cu_limit: u32,
+    /// Макс. проскальзывание в bps при входе/выходе.
+    #[serde(default = "default_slippage")]
+    pub slippage_bps: u64,
+    /// Сколько слотов подряд спамить выход, прежде чем сдаться.
+    #[serde(default = "default_spam_slots")]
+    pub exit_spam_slots: u64,
+    /// Период опроса состояния (мс).
+    #[serde(default = "default_poll_ms")]
+    pub poll_ms: u64,
+    /// Сухой прогон: строить и логировать транзакции, но НЕ отправлять.
+    #[serde(default = "truev")]
+    pub dry_run: bool,
+    /// Макс. одновременно открытых позиций.
+    #[serde(default = "default_max_positions")]
+    pub max_concurrent_positions: usize,
+    /// Durable-nonce аккаунт для долгоживущего спам-выхода (опц.).
+    /// Если None — спамим на свежем blockhash (переподписываем каждые ~40 слотов).
+    #[serde(default)]
+    pub nonce_account: Option<String>,
+    /// Ставить ли Lighthouse-гейт на выход (ждать, что раунд выдал сток).
+    #[serde(default = "truev")]
+    pub lighthouse_exit_gate: bool,
+    /// Насколько (в базовых единицах стока) должен вырасти баланс reward-кошелька,
+    /// чтобы считать, что раунд прошёл. Подбирается под конкретный сток.
+    #[serde(default = "default_gate_eps")]
+    pub exit_gate_epsilon: u64,
+    /// Lighthouse-гейт на входе: «мой ATA монеты ещё пуст» → из N веерных копий
+    /// исполнится ровно одна (защита от двойной покупки).
+    #[serde(default = "truev")]
+    pub entry_gate: bool,
+    /// Веерить вход на все релеи (безопасно только при entry_gate=true).
+    #[serde(default)]
+    pub fanout_entry: bool,
+}
+
+fn default_gate_eps() -> u64 {
+    1
+}
+
+fn one() -> f64 {
+    1.0
+}
+fn truev() -> bool {
+    true
+}
+fn default_buy_cu_price() -> u64 {
+    5_000_000
+}
+// Вход: ATA мемкоина + ATA стока (idempotent) + pump buy. По факту ~70-90k CU,
+// ставим 120k с запасом.
+fn default_buy_cu_limit() -> u32 {
+    120_000
+}
+fn default_sell_cu_price() -> u64 {
+    136_000
+}
+// Выход: nonce advance + CU + 1-2 Lighthouse-ассерта + pump sell. По факту ~60-75k,
+// ставим 90k с запасом.
+fn default_sell_cu_limit() -> u32 {
+    90_000
+}
+fn default_slippage() -> u64 {
+    1500
+}
+fn default_spam_slots() -> u64 {
+    40
+}
+fn default_poll_ms() -> u64 {
+    400
+}
+fn default_max_positions() -> usize {
+    3
+}
+
+/// Фильтры отбора монет — ЭТО то, что будем оптимизировать потом.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FilterConfig {
+    /// Брать только монеты с market cap ниже порога (USD). Лоукап-стратегия.
+    #[serde(default = "default_max_mcap")]
+    pub max_market_cap_usd: f64,
+    /// Минимальный market cap (отсечь совсем мёртвые/скам).
+    #[serde(default = "default_min_mcap")]
+    pub min_market_cap_usd: f64,
+    /// Накопленная доля держателей (SOL) должна быть не ниже — раунд близко.
+    #[serde(default = "default_min_pending")]
+    pub min_pending_reward_sol: f64,
+    /// ...и не выше (иначе раунд уже прошёл/вот-вот, можем не успеть войти).
+    #[serde(default = "default_max_pending")]
+    pub max_pending_reward_sol: f64,
+    /// Минимальный ожидаемый EV входа в SOL (после комиссий), иначе скип.
+    #[serde(default = "default_min_ev")]
+    pub min_expected_ev_sol: f64,
+    /// Допущение: какая доля market cap (%) — это «квалифицированный флоат»
+    /// (кошельки ≥ $20, конкурирующие за раздачу). Кривая/пул/creator-vault из
+    /// раздачи исключены, поэтому на свежем лоукапе реальный флоат мал → ставь
+    /// меньше. Используется в оценке нашей доли. ТОЧНОЕ значение — из он-чейн
+    /// анализа холдеров (следующий шаг); пока это knob-допущение.
+    #[serde(default = "default_max_float")]
+    pub qualified_float_pct: f64,
+    /// Сколько SOL раздаётся за раунд (порог раунда = 0.1 SOL доли держателей).
+    #[serde(default = "default_round_payout")]
+    pub round_payout_sol: f64,
+    /// Сколько раундов рассчитываем собрать за одно удержание.
+    #[serde(default = "default_rounds")]
+    pub assumed_rounds_per_hold: f64,
+    /// Ожидаемая просадка на round-trip самой монеты (доля от buy_sol).
+    #[serde(default = "default_drawdown")]
+    pub coin_drawdown_frac: f64,
+    /// Комиссии+tip за цикл входа/выхода (SOL).
+    #[serde(default = "default_round_fees")]
+    pub round_fees_sol: f64,
+    /// Мин. объём за 24ч (USD): фисы копятся от объёма, значит раунд придёт быстро,
+    /// и монету не сольют в ноль, пока ждём. Главный фильтр «чтобы не срали на ебало».
+    #[serde(default = "default_min_vol")]
+    pub min_volume_24h_usd: f64,
+    /// Мин. ликвидность (USD): чтобы и монету, и награду реально можно было продать.
+    #[serde(default = "default_min_liq")]
+    pub min_liquidity_usd: f64,
+    /// Чёрный список reward-активов (не фармить монеты, платящие этим).
+    #[serde(default)]
+    pub reward_mint_denylist: Vec<String>,
+    /// Если непусто — брать только монеты, платящие этими reward-активами.
+    #[serde(default)]
+    pub reward_mint_allowlist: Vec<String>,
+}
+
+impl Default for FilterConfig {
+    fn default() -> Self {
+        Self {
+            max_market_cap_usd: default_max_mcap(),
+            min_market_cap_usd: default_min_mcap(),
+            min_pending_reward_sol: default_min_pending(),
+            max_pending_reward_sol: default_max_pending(),
+            min_expected_ev_sol: default_min_ev(),
+            qualified_float_pct: default_max_float(),
+            round_payout_sol: default_round_payout(),
+            assumed_rounds_per_hold: default_rounds(),
+            coin_drawdown_frac: default_drawdown(),
+            round_fees_sol: default_round_fees(),
+            min_volume_24h_usd: default_min_vol(),
+            min_liquidity_usd: default_min_liq(),
+            reward_mint_denylist: vec![],
+            reward_mint_allowlist: vec![],
+        }
+    }
+}
+
+fn default_max_mcap() -> f64 {
+    15_000.0
+}
+fn default_min_mcap() -> f64 {
+    2_000.0
+}
+fn default_min_pending() -> f64 {
+    0.06
+}
+fn default_max_pending() -> f64 {
+    0.10
+}
+fn default_min_ev() -> f64 {
+    0.0
+}
+fn default_max_float() -> f64 {
+    20.0
+}
+fn default_round_payout() -> f64 {
+    0.1
+}
+fn default_rounds() -> f64 {
+    1.0
+}
+fn default_drawdown() -> f64 {
+    0.08
+}
+fn default_round_fees() -> f64 {
+    0.01
+}
+fn default_min_vol() -> f64 {
+    4_000.0
+}
+fn default_min_liq() -> f64 {
+    2_000.0
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct IncineratorConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Период уборки (секунды).
+    #[serde(default = "default_burn_interval")]
+    pub interval_secs: u64,
+    /// Закрывать только аккаунты с нулевым балансом.
+    #[serde(default = "truev")]
+    pub only_zero_balance: bool,
+    /// Доп. список mint'ов, которые НИКОГДА не трогать (помимо авто-детекта стоков).
+    #[serde(default)]
+    pub keep_mints: Vec<String>,
+    /// Макс. аккаунтов за один проход (чтобы не упереться в лимит tx).
+    #[serde(default = "default_burn_batch")]
+    pub max_per_run: usize,
+}
+
+impl Default for IncineratorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: default_burn_interval(),
+            only_zero_balance: true,
+            keep_mints: vec![],
+            max_per_run: default_burn_batch(),
+        }
+    }
+}
+
+fn default_burn_interval() -> u64 {
+    1800
+}
+fn default_burn_batch() -> usize {
+    20
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct JupiterConfig {
+    #[serde(default = "default_jup_quote")]
+    pub quote_url: String,
+    #[serde(default = "default_jup_swap")]
+    pub swap_url: String,
+    /// Проскальзывание при сбросе наград (стоки неликвидные — ставим шире).
+    #[serde(default = "default_reward_slippage")]
+    pub slippage_bps: u64,
+    /// Минимальная стоимость награды в SOL, ниже которой не продаём (dust).
+    #[serde(default = "default_min_reward")]
+    pub min_reward_sol: f64,
+}
+
+impl Default for JupiterConfig {
+    fn default() -> Self {
+        Self {
+            quote_url: default_jup_quote(),
+            swap_url: default_jup_swap(),
+            slippage_bps: default_reward_slippage(),
+            min_reward_sol: default_min_reward(),
+        }
+    }
+}
+
+fn default_jup_quote() -> String {
+    "https://quote-api.jup.ag/v6/quote".into()
+}
+fn default_jup_swap() -> String {
+    "https://quote-api.jup.ag/v6/swap".into()
+}
+fn default_reward_slippage() -> u64 {
+    3000
+}
+fn default_min_reward() -> f64 {
+    0.01
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OtcConfig {
+    /// База OTC API (см. docs: /api/coins, /api/pairs).
+    #[serde(default = "default_otc_base")]
+    pub api_base: String,
+    /// Какой оракул рынка/раундов использовать: "api" или "onchain".
+    #[serde(default = "default_oracle")]
+    pub oracle: String,
+}
+
+impl Default for OtcConfig {
+    fn default() -> Self {
+        Self {
+            api_base: default_otc_base(),
+            oracle: default_oracle(),
+        }
+    }
+}
+
+fn default_otc_base() -> String {
+    "https://otcdesks.cash".into()
+}
+fn default_oracle() -> String {
+    "api".into()
+}
+
+/// Чтение шредов через Raiden Pulse (decoded shreds over gRPC).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ShredsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Региональный Pulse-эндпоинт (plaintext gRPC, http://). FRA/AMS/NYC.
+    #[serde(default = "default_pulse")]
+    pub endpoint: String,
+    /// Имя фильтра (любое). По умолчанию "otc".
+    #[serde(default = "default_filter_name")]
+    pub filter_name: String,
+    /// account_required: tx должна трогать ВСЕ эти аккаунты.
+    #[serde(default)]
+    pub account_required: Vec<String>,
+    /// account_include: tx должна трогать хотя бы один. Если все три списка
+    /// пусты — по умолчанию следим за reward-кошельком OTC.
+    #[serde(default)]
+    pub account_include: Vec<String>,
+    #[serde(default)]
+    pub account_exclude: Vec<String>,
+}
+
+impl Default for ShredsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: default_pulse(),
+            filter_name: default_filter_name(),
+            account_required: vec![],
+            account_include: vec![],
+            account_exclude: vec![],
+        }
+    }
+}
+
+fn default_pulse() -> String {
+    "http://fra.pulse.raiden.wtf:16000".into()
+}
+fn default_filter_name() -> String {
+    "otc".into()
+}
+
+/// Отчётность: подробный PnL по сделкам в Telegram + локальный JSONL-журнал.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TelegramConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Токен бота от @BotFather.
+    #[serde(default)]
+    pub bot_token: String,
+    /// ID чата/канала, куда слать (можно свой личный chat_id).
+    #[serde(default)]
+    pub chat_id: String,
+    /// Период сводки, секунды (0 = без периодической сводки).
+    #[serde(default = "default_summary_secs")]
+    pub summary_every_secs: u64,
+    /// Локальный JSONL-журнал сделок (пусто = не писать файл).
+    #[serde(default = "default_journal")]
+    pub journal_path: String,
+}
+
+impl Default for TelegramConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bot_token: String::new(),
+            chat_id: String::new(),
+            summary_every_secs: default_summary_secs(),
+            journal_path: default_journal(),
+        }
+    }
+}
+
+fn default_summary_secs() -> u64 {
+    3600
+}
+fn default_journal() -> String {
+    "feebot-journal.jsonl".into()
+}
+
+impl Config {
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let p = path.as_ref();
+        let raw = std::fs::read_to_string(p)
+            .with_context(|| format!("не читается конфиг {}", p.display()))?;
+        let cfg: Config = toml::from_str(&raw).context("битый TOML в конфиге")?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(self.strategy.buy_sol > 0.0, "strategy.buy_sol должен быть > 0");
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&self.strategy.sell_fraction),
+            "strategy.sell_fraction в [0,1]"
+        );
+        Ok(())
+    }
+}
