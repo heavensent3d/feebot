@@ -237,6 +237,7 @@ impl Bot {
             considered += 1;
             // Пометить активной и запустить позицию в отдельной задаче.
             self.active.lock().await.insert(c.mint);
+            self.set_busy(true); // ≥1 позиция открыта → маркер для деплой-скрипта
             let me = Arc::clone(self);
             tokio::spawn(async move {
                 // Пермит живёт до конца позиции → слот освобождается только после
@@ -247,8 +248,16 @@ impl Bot {
                 if let Err(e) = me.run_position(c).await {
                     warn!("позиция {mint}: {e:#}");
                 }
-                me.active.lock().await.remove(&mint);
                 me.active_reward_mints.lock().await.remove(&reward_mint);
+                // Снимаем маркер «в позиции» только когда флэт (под тем же локом,
+                // чтобы не было гонки с открытием новой позиции).
+                {
+                    let mut a = me.active.lock().await;
+                    a.remove(&mint);
+                    if a.is_empty() {
+                        me.set_busy(false);
+                    }
+                }
             });
         }
         if considered > 0 {
@@ -650,6 +659,26 @@ impl Bot {
 
     // ───────── helpers ─────────
 
+    /// Снять маркер «в позиции» на старте: если бот упал посреди сделки, старый
+    /// маркер остался бы висеть и вечно блокировал бы деплой. На старте мы флэт.
+    pub fn clear_stale_busy(&self) {
+        self.set_busy(false);
+    }
+
+    /// Создать/удалить маркер «в позиции» (см. `strategy.busy_marker`). Best-effort:
+    /// ошибки ФС только логируем — они не должны ронять торговлю.
+    fn set_busy(&self, busy: bool) {
+        let path = &self.cfg.strategy.busy_marker;
+        if busy {
+            if let Err(e) = std::fs::write(path, b"1") {
+                warn!("не смог создать busy-маркер {path}: {e}");
+            }
+        } else if let Err(e) = std::fs::remove_file(path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!("не смог удалить busy-маркер {path}: {e}");
+            }
+        }
+    }
 }
 
 fn apply_slip_up(lamports: u64, bps: u64) -> u64 {

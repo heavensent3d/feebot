@@ -6,3 +6,5 @@ config.toml
 /research
 /proto
 /config
+/.position_open
+/.needs_restart

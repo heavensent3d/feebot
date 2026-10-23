@@ -307,6 +307,8 @@ async fn run_loops(
     payer: Arc<solana_sdk::signature::Keypair>,
     inc_cfg: config::IncineratorConfig,
 ) -> Result<()> {
+    // Снять возможный залипший busy-маркер (краш посреди сделки) — на старте флэт.
+    bot.clear_stale_busy();
     // 1) вход/выход. Шреды будят опрос немедленно; иначе — по таймеру.
     {
         let bot = Arc::clone(&bot);

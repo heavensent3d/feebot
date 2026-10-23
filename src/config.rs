@@ -125,6 +125,15 @@ pub struct StrategyConfig {
     /// Веерить вход на все релеи (безопасно только при entry_gate=true).
     #[serde(default)]
     pub fanout_entry: bool,
+    /// Путь к маркер-файлу «в позиции»: бот создаёт его, пока открыта хотя бы
+    /// одна позиция, и удаляет, когда флэт. Внешний деплой-скрипт читает его,
+    /// чтобы не рестартить бота посреди сделки. Путь относительно cwd бота.
+    #[serde(default = "default_busy_marker")]
+    pub busy_marker: String,
+}
+
+fn default_busy_marker() -> String {
+    ".position_open".into()
 }
 
 fn default_gate_eps() -> u64 {
