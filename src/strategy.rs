@@ -34,7 +34,7 @@ use solana_sdk::signature::{Keypair, Signer};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
 use tracing::{info, warn};
 
 const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
@@ -49,6 +49,11 @@ pub struct Bot {
     pub payer: Arc<Keypair>,
     pub reporter: Arc<Reporter>,
     active: Arc<Mutex<HashSet<Pubkey>>>,
+    /// Жёсткий потолок одновременных позиций (race-free). Пермит берётся ПЕРЕД
+    /// спавном задачи и живёт до её конца. При max_concurrent_positions=1 это
+    /// гарантирует: в любой момент открыта максимум ОДНА позиция, даже если
+    /// два тика входа (интервал + будилка от шредов) наложились.
+    slots: Arc<Semaphore>,
     /// Какие reward-стоки уже фармим: не держим два разных мемкоина на один сток,
     /// иначе раунд одного ложно триггерит выход другого (общий ATA стока).
     active_reward_mints: Arc<Mutex<HashSet<Pubkey>>>,
@@ -72,6 +77,7 @@ impl Bot {
         payer: Arc<Keypair>,
         reporter: Arc<Reporter>,
     ) -> Self {
+        let slot_count = cfg.strategy.max_concurrent_positions.max(1);
         Self {
             cfg,
             rpc,
@@ -82,6 +88,7 @@ impl Bot {
             payer,
             reporter,
             active: Arc::new(Mutex::new(HashSet::new())),
+            slots: Arc::new(Semaphore::new(slot_count)),
             active_reward_mints: Arc::new(Mutex::new(HashSet::new())),
             sol_price: Arc::new(Mutex::new((0.0, std::time::Instant::now()))),
             exit_registry: Arc::new(Mutex::new(HashMap::new())),
@@ -182,19 +189,23 @@ impl Bot {
 
     /// Один проход отбора: берём кандидатов, фильтруем, открываем позиции.
     pub async fn tick_entries(self: &Arc<Self>) -> Result<()> {
+        // Потолок занят целиком → не дёргаем RPC впустую (при max=1 это значит
+        // «позиция уже открыта»).
+        if self.slots.available_permits() == 0 {
+            return Ok(());
+        }
         let cands = self.oracle.candidates().await?;
         let sol_price = self.sol_price_usd().await;
         let buy_sol = self.cfg.strategy.buy_sol;
         let mut considered = 0usize;
         for c in cands {
-            {
-                let active = self.active.lock().await;
-                if active.len() >= self.cfg.strategy.max_concurrent_positions {
-                    break;
-                }
-                if active.contains(&c.mint) {
-                    continue;
-                }
+            // Нет свободного слота — дальше перебирать незачем.
+            if self.slots.available_permits() == 0 {
+                break;
+            }
+            // Уже держим этот мемкоин.
+            if self.active.lock().await.contains(&c.mint) {
+                continue;
             }
             // Дешёвый прескрин без RPC.
             if matches!(self.filters.prescreen(&c), Verdict::Skip(_)) {
@@ -214,11 +225,23 @@ impl Bot {
                 }
                 rm.insert(c.reward_mint);
             }
+            // Жёсткий слот (атомарно). Не удалось — потолок занят: откатываем
+            // резерв стока и прекращаем перебор.
+            let permit = match Arc::clone(&self.slots).try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    self.active_reward_mints.lock().await.remove(&c.reward_mint);
+                    break;
+                }
+            };
             considered += 1;
             // Пометить активной и запустить позицию в отдельной задаче.
             self.active.lock().await.insert(c.mint);
             let me = Arc::clone(self);
             tokio::spawn(async move {
+                // Пермит живёт до конца позиции → слот освобождается только после
+                // полного закрытия (вход+выход+отчёт).
+                let _permit = permit;
                 let reward_mint = c.reward_mint;
                 let mint = c.mint;
                 if let Err(e) = me.run_position(c).await {
