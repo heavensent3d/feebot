@@ -37,11 +37,16 @@ mev_protect = false
 # kind = "nozomi"
 # tip_lamports = 1000000
 
-# Constant-K: staked sendTransaction (SWQoS), БЕЗ tip. Нужен план Operator+.
-# Формат: https://staked-rpc-<region>.constant-k.com/?api-key=KEY  (newyork/frankfurt/amsterdam)
+# Constant-K: staked sendTransaction (SWQoS), БЕЗ tip-аккаунта. Путь выбирается
+# ХОСТОМ: https://staked-rpc-<region>.constant-k.com/?api-key=KEY (newyork/frankfurt/amsterdam).
+# ⚠️ staked-хост нужен план Operator+. На FREE/триале его НЕТ — доступен только
+#    обычный rpc-frankfurt.constant-k.com (его же ставь в [rpc] http — решает
+#    fetch_template). staked делает 1 попытку → ребродкаст делает наш спам-выход.
+# ⚠️ Даже на staked ставь priority fee (buy_cu_price/sell_cu_price ниже) — без
+#    него staked-send проигрывает тем, кто платит CU-price. Это и есть наш «tip».
 # [[relays]]
 # name = "constant-k"
-# url = "https://staked-rpc-frankfurt.constant-k.com/?api-key=YOUR_KEY"
+# url = "https://staked-rpc-frankfurt.constant-k.com/?api-key=YOUR_KEY"   # триал: rpc-frankfurt (без staked-)
 # kind = "constant-k"
 # tip_lamports = 0
 # Про Neon Zero (гейт latency-to-leader, план Nexus): https://neon-rpc-<region>.constant-k.com/?api-key=KEY
