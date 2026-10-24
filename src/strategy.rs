@@ -657,12 +657,35 @@ impl Bot {
         // Порог «следующего» реворда: после каждого полученного сдвигаем выше,
         // чтобы ждать именно НОВЫЙ раунд, а не видеть старый баланс.
         let mut next_threshold = threshold;
+        // Выход сработал по защите прибыли (профит утёк обратно) → продаём в безубыток.
+        let mut breakeven_stop = false;
+        let mut polls = 0u32;
         'hold: loop {
             let mut hit = false;
             while std::time::Instant::now() < deadline {
                 tokio::select! {
                     _ = notify.notified() => {}
                     _ = tokio::time::sleep(poll) => {}
+                }
+                // ЗАЩИТА ПРИБЫЛИ: реворд уже взят и мы держим ради следующего —
+                // следим, чтобы дамп конкурентов (после раздачи) не съел плюс.
+                if rewards_collected > 0 {
+                    polls += 1;
+                    if polls % self.cfg.strategy.profit_check_every_polls.max(1) == 0 {
+                        if let Some(p) = self
+                            .position_profit_pct(&mint, &c.reward_mint, sell_amount, reward_ata, reward_baseline)
+                            .await
+                        {
+                            if p <= self.cfg.strategy.breakeven_exit_pct {
+                                warn!(
+                                    "EXIT {mint}: профит просел до {p:.1}% (≤{:.1}%) → выходим в безубыток, не отдаём прибыль",
+                                    self.cfg.strategy.breakeven_exit_pct
+                                );
+                                breakeven_stop = true;
+                                break;
+                            }
+                        }
+                    }
                 }
                 let reward_now = self.rpc.token_amount(reward_ata).await.unwrap_or(reward_baseline);
                 if reward_now >= next_threshold {
@@ -675,6 +698,9 @@ impl Bot {
                     next_threshold = reward_now.saturating_add(self.cfg.strategy.exit_gate_epsilon);
                     break;
                 }
+            }
+            if breakeven_stop {
+                break 'hold; // прибыль утекает — выходим немедленно
             }
             if !hit {
                 break 'hold; // дедлайн без реворда
@@ -712,15 +738,30 @@ impl Bot {
             }
             warn!("EXIT {mint}: за {}s раунд не пришёл → продаём по рынку (бейл, в убыток)", self.cfg.strategy.hold_max_secs);
         }
-        // На бейле снижаем пол (согласны на ограниченный минус), но НЕ дампим в ноль.
-        let bail_ix = if !got_reward && sell_amount > 0 {
-            let floor = cost_lamports.saturating_mul(self.cfg.strategy.bail_floor_bps) / 10_000;
+        // Пол продажи зависит от причины выхода:
+        //  • защита прибыли  → ровно безубыток (иначе продажа не пройдёт и плюс утечёт);
+        //  • реворд получен  → обычный пол с таргетом;
+        //  • таймаут без реворда → аварийный пол (ограниченный минус), но не ноль.
+        let floor_bps = if breakeven_stop {
+            self.cfg.strategy.breakeven_floor_bps
+        } else if got_reward {
+            self.cfg.strategy.sell_floor_bps
+        } else {
+            self.cfg.strategy.bail_floor_bps
+        };
+        let final_floor = cost_lamports.saturating_mul(floor_bps) / 10_000;
+        let bail_ix = if sell_amount > 0 && floor_bps != self.cfg.strategy.sell_floor_bps {
             Some(pumpfun::build_sell_derived(
-                &me, &mint, &creator, &coin_tp, fees, sell_amount, floor,
+                &me, &mint, &creator, &coin_tp, fees, sell_amount, final_floor,
             ))
         } else {
             None
         };
+        info!(
+            "EXIT {mint}: продаём с полом {:.4} SOL ({} bps от затрат), реворд={got_reward}",
+            final_floor as f64 / LAMPORTS_PER_SOL,
+            floor_bps
+        );
         for _ in 0..15 {
             let mut ixs: Vec<Instruction> =
                 compute_budget(self.cfg.strategy.sell_cu_limit, self.cfg.strategy.sell_cu_price).to_vec();

@@ -169,6 +169,28 @@ pub struct StrategyConfig {
     /// Максимум ревордов за один холд (чтобы не держать бесконечно).
     #[serde(default = "default_max_rewards_per_hold")]
     pub max_rewards_per_hold: u32,
+    /// ЗАЩИТА ПРИБЫЛИ. Если реворд уже получен и мы держим ради следующего, а
+    /// профит просел до этого % (конкуренты дампят после раздачи) — выходим,
+    /// не отдавая прибыль обратно. 2.0 = выйти в безубыток с запасом на комиссии.
+    #[serde(default = "default_breakeven_exit_pct")]
+    pub breakeven_exit_pct: f64,
+    /// Пол продажи при выходе в безубыток (10000 = ровно стоимость входа).
+    #[serde(default = "default_breakeven_floor_bps")]
+    pub breakeven_floor_bps: u64,
+    /// Как часто (в тиках опроса) считать профит во время холда — расчёт не
+    /// бесплатный (чтение кривой + котировка), поэтому не каждый тик.
+    #[serde(default = "default_profit_check_every")]
+    pub profit_check_every_polls: u32,
+}
+
+fn default_breakeven_exit_pct() -> f64 {
+    2.0
+}
+fn default_breakeven_floor_bps() -> u64 {
+    10_000
+}
+fn default_profit_check_every() -> u32 {
+    20
 }
 
 fn default_hold_more_profit_pct() -> f64 {
