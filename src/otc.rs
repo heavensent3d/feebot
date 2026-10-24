@@ -41,6 +41,11 @@ pub struct OtcCoin {
     #[serde(default)]
     pub snapshot: Option<Snapshot>,
 
+    /// Приходит ТОЛЬКО в `/api/coins?mint=X` (в списке страниц его нет).
+    /// Содержит owed / distributed / lastPaidHolders — сигналы отбора и тайминга.
+    #[serde(default)]
+    pub rewards: Option<OtcRewards>,
+
     /// Накопленная доля держателей в SOL (в /api/coins НЕ приходит — оставлено
     /// на случай, если появится в другом эндпоинте).
     #[serde(
@@ -69,6 +74,33 @@ pub struct Snapshot {
     pub holders: Option<u64>,
     #[serde(default, alias = "usdPrice")]
     pub usd_price: Option<f64>,
+    /// Изменение цены за 24ч (%) — моментум-фильтр (не входить в обвал).
+    #[serde(default, alias = "change24h")]
+    pub change24h: Option<f64>,
+}
+
+/// Объект `rewards` из `/api/coins?mint=X` — ЭТО ГЛАВНЫЙ ИСТОЧНИК СИГНАЛА.
+/// Все суммы в лампортах.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct OtcRewards {
+    /// Накоплено холдерам и ждёт раздачи (ТАЙМИНГ входа: чем ближе к порогу, тем скорее раунд).
+    #[serde(default)]
+    pub owed: u64,
+    /// Роздано холдерам за всю жизнь монеты (ФИЛЬТР КАЧЕСТВА: монета реально платит).
+    #[serde(default)]
+    pub distributed: u64,
+    /// Заработано всего (фисы).
+    #[serde(default)]
+    pub earned: u64,
+    /// Сколько холдеров делили ПОСЛЕДНЮЮ выплату — прямой прокси флоата:
+    /// чем меньше, тем больше наша доля. Избавляет от тяжёлого getTokenLargestAccounts.
+    #[serde(default, alias = "lastPaidHolders")]
+    pub last_paid_holders: u64,
+    /// Сколько раундов уже прошло.
+    #[serde(default)]
+    pub payouts: u64,
+    #[serde(default, alias = "lastDistributedAt")]
+    pub last_distributed_at: u64,
 }
 
 impl OtcClient {
@@ -79,12 +111,20 @@ impl OtcClient {
         }
     }
 
-    /// Список монет (борда лаунчера).
+    /// Список монет (борда лаунчера). Без параметров отдаёт лишь ПЕРВУЮ страницу —
+    /// на борде ~51k монет, поэтому для отбора используем `coins_by_volume`.
     pub async fn coins(&self) -> Result<Vec<OtcCoin>> {
-        let url = format!("{}/api/coins", self.base);
+        self.coins_page(0, 50, "volume24h").await
+    }
+
+    /// Одна страница борды с сортировкой (работает `sort=volume24h&dir=desc`).
+    pub async fn coins_page(&self, page: usize, size: usize, sort: &str) -> Result<Vec<OtcCoin>> {
+        let url = format!(
+            "{}/api/coins?page={page}&size={size}&sort={sort}&dir=desc",
+            self.base
+        );
         let resp = self.http.get(&url).send().await.context("otc coins send")?;
         let text = resp.text().await.context("otc coins body")?;
-        // API может вернуть либо массив, либо {coins:[...]}.
         if let Ok(v) = serde_json::from_str::<Vec<OtcCoin>>(&text) {
             return Ok(v);
         }
@@ -95,6 +135,46 @@ impl OtcClient {
         }
         let w: Wrap = serde_json::from_str(&text).context("otc coins parse")?;
         Ok(w.coins)
+    }
+
+    /// Несколько страниц, отсортированных по объёму (там, где копятся фисы).
+    pub async fn coins_by_volume(&self, pages: usize, size: usize) -> Result<Vec<OtcCoin>> {
+        let mut out = Vec::new();
+        for p in 0..pages.max(1) {
+            match self.coins_page(p, size, "volume24h").await {
+                Ok(mut v) => {
+                    if v.is_empty() {
+                        break;
+                    }
+                    out.append(&mut v);
+                }
+                Err(e) => {
+                    if p == 0 {
+                        return Err(e);
+                    }
+                    break; // частичный список лучше, чем ничего
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Детали ОДНОЙ монеты — единственный путь получить объект `rewards`
+    /// (owed / distributed / lastPaidHolders).
+    pub async fn coin_detail(&self, mint: &str) -> Result<OtcCoin> {
+        let url = format!("{}/api/coins?mint={mint}", self.base);
+        let resp = self.http.get(&url).send().await.context("otc coin send")?;
+        let text = resp.text().await.context("otc coin body")?;
+        #[derive(Deserialize)]
+        struct Wrap {
+            #[serde(alias = "coins", alias = "data", alias = "items")]
+            coins: Vec<OtcCoin>,
+        }
+        let w: Wrap = serde_json::from_str(&text).context("otc coin parse")?;
+        w.coins
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("монета {mint} не найдена в /api/coins?mint="))
     }
 
     /// Список стоков, которые pump принимает как quote (из docs: /api/pairs).

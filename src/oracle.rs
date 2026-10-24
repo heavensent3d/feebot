@@ -24,22 +24,50 @@ pub struct Candidate {
     pub liquidity_usd: Option<f64>,
     pub holders: Option<u64>,
     pub pending_reward_sol: Option<f64>,
+    /// Изменение цены за 24ч (%) — не входим в обвал.
+    pub change_24h_pct: Option<f64>,
+    /// ── Ниже заполняется ТОЛЬКО через `Oracle::enrich_rewards` (per-coin запрос),
+    /// т.к. объект `rewards` приходит лишь из `/api/coins?mint=X`. ──
+    /// Накоплено холдерам и ждёт раздачи (SOL) — тайминг входа.
+    pub owed_sol: Option<f64>,
+    /// Роздано холдерам за жизнь монеты (SOL) — фильтр качества («от 0.4»).
+    pub distributed_sol: Option<f64>,
+    /// Сколько холдеров делили последнюю выплату — прокси флоата (меньше = наша доля больше).
+    pub last_paid_holders: Option<u64>,
 }
 
 pub struct Oracle {
     otc: OtcClient,
+    /// Сколько страниц борды тянуть (борда ~51k монет, сортируем по объёму).
+    pages: usize,
+    page_size: usize,
 }
 
 impl Oracle {
     pub fn new(cfg: &OtcConfig) -> Self {
         Self {
             otc: OtcClient::new(cfg),
+            pages: cfg.pages,
+            page_size: cfg.page_size,
         }
     }
 
-    /// Снять текущую борду и собрать кандидатов.
+    /// Догрузить `rewards` по монете (owed / distributed / lastPaidHolders).
+    /// Отдельный per-coin запрос — дёргаем только для прошедших дешёвый прескрин.
+    /// Возвращает (owed_sol, distributed_sol, last_paid_holders).
+    pub async fn enrich_rewards(&self, mint: &Pubkey) -> Option<(f64, f64, u64)> {
+        let c = self.otc.coin_detail(&mint.to_string()).await.ok()?;
+        let r = c.rewards?;
+        Some((
+            r.owed as f64 / 1e9,
+            r.distributed as f64 / 1e9,
+            r.last_paid_holders,
+        ))
+    }
+
+    /// Снять борду (страницы по объёму — там, где реально копятся фисы) и собрать кандидатов.
     pub async fn candidates(&self) -> Result<Vec<Candidate>> {
-        let coins = self.otc.coins().await?;
+        let coins = self.otc.coins_by_volume(self.pages, self.page_size).await?;
         let mut out = Vec::new();
         for c in coins {
             let Ok(mint) = Pubkey::from_str(&c.mint) else {
@@ -80,6 +108,11 @@ impl Oracle {
                 liquidity_usd: snap.liquidity,
                 holders: snap.holders,
                 pending_reward_sol: c.pending_reward_sol,
+                change_24h_pct: snap.change24h,
+                // rewards приходят только из per-coin запроса → догружаем позже.
+                owed_sol: c.rewards.as_ref().map(|r| r.owed as f64 / 1e9),
+                distributed_sol: c.rewards.as_ref().map(|r| r.distributed as f64 / 1e9),
+                last_paid_holders: c.rewards.as_ref().map(|r| r.last_paid_holders),
             });
         }
         Ok(out)

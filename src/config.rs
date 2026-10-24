@@ -153,10 +153,41 @@ pub struct StrategyConfig {
     /// Кулдаун (сек) на повторный вход в ту же монету после сделки.
     #[serde(default = "default_post_trade_cooldown")]
     pub post_trade_cooldown_secs: u64,
+    /// ЦЕНОВОЙ ПОЛ продажи в bps от стоимости входа (10300 = продать не дешевле
+    /// 103% затрат). Ниже пола tx просто падает (дёшево) — убыток НЕ фиксируем.
+    /// Так работает бот, который зарабатывает; min_sol_out=0 (дамп) нас и сливал.
+    #[serde(default = "default_sell_floor_bps")]
+    pub sell_floor_bps: u64,
+    /// Пол для АВАРИЙНОЙ продажи по таймауту (9000 = согласны максимум на −10%),
+    /// чтобы не зависнуть на мешке навсегда, но и не дампить в ноль.
+    #[serde(default = "default_bail_floor_bps")]
+    pub bail_floor_bps: u64,
+}
+
+fn default_sell_floor_bps() -> u64 {
+    10_300
+}
+fn default_bail_floor_bps() -> u64 {
+    9_000
 }
 
 fn default_max_float_usd() -> f64 {
     400.0
+}
+fn default_min_distributed() -> f64 {
+    0.4
+}
+fn default_max_paid_holders() -> u64 {
+    4
+}
+fn default_min_owed() -> f64 {
+    0.0
+}
+fn default_max_drop_24h() -> f64 {
+    -60.0
+}
+fn default_max_drop() -> f64 {
+    default_max_drop_24h()
 }
 fn default_round_window_secs() -> u64 {
     600
@@ -226,6 +257,21 @@ pub struct FilterConfig {
     /// Минимальный market cap (отсечь совсем мёртвые/скам).
     #[serde(default = "default_min_mcap")]
     pub min_market_cap_usd: f64,
+    /// ── Фильтры по rewards-API OTC (профиль работающего бота) ──
+    /// Монета должна УЖЕ раздать холдерам ≥ этого (SOL) — доказала, что платит.
+    /// У danek'а это «беру от 0.4 раунды».
+    #[serde(default = "default_min_distributed")]
+    pub min_distributed_sol: f64,
+    /// Максимум холдеров, деливших последнюю выплату. Меньше = наша доля больше.
+    /// Главный источник эджа (у реальной сделки было 3).
+    #[serde(default = "default_max_paid_holders")]
+    pub max_last_paid_holders: u64,
+    /// Минимум накопленного холдерам (SOL) — чтобы раунд был близко/жирный.
+    #[serde(default = "default_min_owed")]
+    pub min_owed_sol: f64,
+    /// Не входить, если цена за 24ч упала сильнее (%, отрицательное). 0 = выключено.
+    #[serde(default = "default_max_drop")]
+    pub max_drop_24h_pct: f64,
     /// Накопленная доля держателей (SOL) должна быть не ниже — раунд близко.
     #[serde(default = "default_min_pending")]
     pub min_pending_reward_sol: f64,
@@ -284,6 +330,10 @@ impl Default for FilterConfig {
             round_fees_sol: default_round_fees(),
             min_volume_24h_usd: default_min_vol(),
             min_liquidity_usd: default_min_liq(),
+            min_distributed_sol: default_min_distributed(),
+            max_last_paid_holders: default_max_paid_holders(),
+            min_owed_sol: default_min_owed(),
+            max_drop_24h_pct: default_max_drop(),
             reward_mint_denylist: vec![],
             reward_mint_allowlist: vec![],
         }
@@ -410,6 +460,19 @@ pub struct OtcConfig {
     /// Какой оракул рынка/раундов использовать: "api" или "onchain".
     #[serde(default = "default_oracle")]
     pub oracle: String,
+    /// Сколько страниц борды тянуть (на борде ~51k монет; сортируем по volume24h).
+    #[serde(default = "default_pages")]
+    pub pages: usize,
+    /// Размер страницы борды (API отдаёт до ~60).
+    #[serde(default = "default_page_size")]
+    pub page_size: usize,
+}
+
+fn default_pages() -> usize {
+    3
+}
+fn default_page_size() -> usize {
+    50
 }
 
 impl Default for OtcConfig {
@@ -417,6 +480,8 @@ impl Default for OtcConfig {
         Self {
             api_base: default_otc_base(),
             oracle: default_oracle(),
+            pages: default_pages(),
+            page_size: default_page_size(),
         }
     }
 }

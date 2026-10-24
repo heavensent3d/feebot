@@ -66,6 +66,45 @@ impl Filters {
             }
         }
 
+        // ── Гейты по rewards-API (профиль работающего бота) ──
+        // Монета должна уже РЕАЛЬНО платить холдерам («беру от 0.4 раунды»).
+        if let Some(d) = c.distributed_sol {
+            if d < self.cfg.min_distributed_sol {
+                return Verdict::Skip(format!(
+                    "роздано {d:.3} SOL < min {:.3} (монета ещё не платит)",
+                    self.cfg.min_distributed_sol
+                ));
+            }
+        }
+        // Чем меньше холдеров делили выплату — тем больше НАША доля. Это сам эдж.
+        if let Some(h) = c.last_paid_holders {
+            if h > self.cfg.max_last_paid_holders {
+                return Verdict::Skip(format!(
+                    "холдеров в выплате {h} > max {} (доля будет мелкой)",
+                    self.cfg.max_last_paid_holders
+                ));
+            }
+        }
+        // Накоплено холдерам — чтобы раунд был близко/жирный.
+        if self.cfg.min_owed_sol > 0.0 {
+            if let Some(o) = c.owed_sol {
+                if o < self.cfg.min_owed_sol {
+                    return Verdict::Skip(format!("накоплено {o:.4} SOL < min {:.4}", self.cfg.min_owed_sol));
+                }
+            }
+        }
+        // Моментум: не входим в обвал (иначе теряем на цене больше, чем дадут реворды).
+        if self.cfg.max_drop_24h_pct < 0.0 {
+            if let Some(ch) = c.change_24h_pct {
+                if ch < self.cfg.max_drop_24h_pct {
+                    return Verdict::Skip(format!(
+                        "обвал {ch:.0}% за 24ч (хуже {:.0}%)",
+                        self.cfg.max_drop_24h_pct
+                    ));
+                }
+            }
+        }
+
         // Накопленная доля: раунд должен быть близко, но ещё не случиться.
         if let Some(p) = c.pending_reward_sol {
             if p < self.cfg.min_pending_reward_sol {

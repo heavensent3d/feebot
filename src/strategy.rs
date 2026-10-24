@@ -279,7 +279,7 @@ impl Bot {
         let max_float = self.cfg.strategy.max_qualified_float_usd;
         let cooldown = self.cfg.strategy.post_trade_cooldown_secs;
         let mut considered = 0usize;
-        for c in cands {
+        for mut c in cands {
             // Нет свободного слота — дальше перебирать незачем.
             if self.slots.available_permits() == 0 {
                 break;
@@ -313,8 +313,22 @@ impl Bot {
                     nt.remove(&c.mint); // кулдаун истёк — дадим ещё шанс
                 }
             }
-            // Дешёвый прескрин без RPC.
+            // Дешёвый прескрин без RPC (капа/объём/ликвидность) — до per-coin запроса.
             if matches!(self.filters.prescreen(&c), Verdict::Skip(_)) {
+                continue;
+            }
+            // Догружаем rewards (owed / distributed / lastPaidHolders) — объект приходит
+            // ТОЛЬКО из /api/coins?mint=X. Это и есть сигналы отбора: платит ли монета
+            // реально и на скольких холдеров делится выплата.
+            if let Some((owed, distributed, paid_holders)) =
+                self.oracle.enrich_rewards(&c.mint).await
+            {
+                c.owed_sol = Some(owed);
+                c.distributed_sol = Some(distributed);
+                c.last_paid_holders = Some(paid_holders);
+            }
+            // Прескрин ещё раз — теперь с rewards-гейтами (роздано / холдеры / обвал).
+            if let Verdict::Skip(_r) = self.filters.prescreen(&c) {
                 continue;
             }
             // Реальный он-чейн флоат только для прошедших прескрин (экономим RPC).
@@ -602,7 +616,14 @@ impl Bot {
             return Err(anyhow!("вход {mint} не подтвердился за ~7.5s — позиция не открыта"));
         }
         let sell_amount = ((bal as f64) * self.cfg.strategy.sell_fraction) as u64;
-        let min_sol_output = 0u64; // широкий — лишь бы приземлилось
+        // ЦЕНОВОЙ ПОЛ (как у работающего бота): НЕ продаём дешевле стоимости входа
+        // + таргет. Транзакция просто упадёт (pump error 6023) и будет стоить
+        // базовую комиссию — зато мы не фиксируем убыток. Дамп «по любой цене»
+        // (min_sol_out=0) — ровно то, на чём мы сливали.
+        let cost_lamports = (self.cfg.strategy.buy_sol * LAMPORTS_PER_SOL) as u64;
+        let min_sol_output = cost_lamports
+            .saturating_mul(self.cfg.strategy.sell_floor_bps)
+            / 10_000;
         let threshold = reward_baseline.saturating_add(self.cfg.strategy.exit_gate_epsilon);
         let gate = self.cfg.strategy.lighthouse_exit_gate;
 
@@ -655,13 +676,22 @@ impl Bot {
             }
             warn!("EXIT {mint}: за {}s раунд не пришёл → продаём по рынку (бейл, в убыток)", self.cfg.strategy.hold_max_secs);
         }
+        // На бейле снижаем пол (согласны на ограниченный минус), но НЕ дампим в ноль.
+        let bail_ix = if !got_reward && sell_amount > 0 {
+            let floor = cost_lamports.saturating_mul(self.cfg.strategy.bail_floor_bps) / 10_000;
+            Some(pumpfun::build_sell_derived(
+                &me, &mint, &creator, &coin_tp, fees, sell_amount, floor,
+            ))
+        } else {
+            None
+        };
         for _ in 0..15 {
             let mut ixs: Vec<Instruction> =
                 compute_budget(self.cfg.strategy.sell_cu_limit, self.cfg.strategy.sell_cu_price).to_vec();
             if use_gate {
                 ixs.push(assert_token_amount(reward_ata, threshold, Op::Gte));
             }
-            if let Some(ix) = &sell_ix {
+            if let Some(ix) = bail_ix.as_ref().or(sell_ix.as_ref()) {
                 ixs.push(ix.clone());
             }
             if let Ok(bh) = self.rpc.latest_blockhash().await {
