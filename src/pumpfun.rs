@@ -244,6 +244,163 @@ pub fn build_sell_from_template(
     Ok(Instruction { program_id: PUMP_PROGRAM, accounts, data })
 }
 
+// ═══════════════════ ДЕРИВАЦИОННЫЙ БИЛДЕР (без шаблона монеты) ═══════════════════
+// Все 16 из 18 аккаунтов buy (и 14 из 16 sell) выводятся детерминированно —
+// сверено байт-в-байт с реальными buy/sell бота FpZAy (24.10.2026, bump'ы и флаги
+// подтверждены). Недеривируемы только coin_fee_A/B (внутренние PDA pfee-программы):
+// их берём из ЛЮБОЙ свежей buy ИЛИ sell этой монеты (sell у торгующихся монет
+// частые — это снимает редкость buy_exact, на которой ломался template-scraping).
+// fee_recipient берём константой PUMP_FEE_RECIPIENT (в whitelist pump, юзался
+// реальным sell; pump принимает его всегда).
+
+/// ATA бондинг-кривой под монетой (её token-программа). Аккаунт 4 в buy/sell.
+pub fn assoc_bonding_curve(mint: &Pubkey, coin_token_program: &Pubkey) -> Pubkey {
+    ata_with(&bonding_curve(mint), mint, coin_token_program)
+}
+
+/// Два per-coin fee-аккаунта pump-fee-программы (coin_fee_A/B), которые нельзя
+/// вывести без IDL pfee. Стабильны per-coin.
+#[derive(Debug, Clone, Copy)]
+pub struct CoinFees {
+    pub coin_fee_a: Pubkey,
+    pub coin_fee_b: Pubkey,
+}
+
+/// Достать coin_fee_A/B из свежей реальной buy ИЛИ sell монеты. В buy они на
+/// индексах 16,17; в sell — 14,15. Сканируем последние сигнатуры (top+inner).
+pub async fn fetch_coin_fees(rpc: &Rpc, mint: &Pubkey) -> Result<CoinFees> {
+    let pump = PUMP_PROGRAM.to_string();
+    let sigs = rpc
+        .raw("getSignaturesForAddress", serde_json::json!([mint.to_string(), {"limit": 40}]))
+        .await?;
+    for s in sigs.as_array().cloned().unwrap_or_default() {
+        if !s.get("err").map(|e| e.is_null()).unwrap_or(false) {
+            continue;
+        }
+        let Some(sig) = s.get("signature").and_then(|x| x.as_str()) else { continue };
+        let tx = match rpc
+            .raw(
+                "getTransaction",
+                serde_json::json!([sig, {"encoding":"jsonParsed","maxSupportedTransactionVersion":0}]),
+            )
+            .await
+        {
+            Ok(t) if !t.is_null() => t,
+            _ => continue,
+        };
+        // top-level + inner инструкции
+        let mut all: Vec<serde_json::Value> = tx["transaction"]["message"]["instructions"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if let Some(inner) = tx["meta"]["innerInstructions"].as_array() {
+            for grp in inner {
+                if let Some(g) = grp["instructions"].as_array() {
+                    all.extend(g.iter().cloned());
+                }
+            }
+        }
+        for ins in &all {
+            if ins["programId"].as_str() != Some(pump.as_str()) {
+                continue;
+            }
+            let data = ins["data"].as_str().unwrap_or("");
+            let bytes = bs58::decode(data).into_vec().unwrap_or_default();
+            if bytes.len() < 8 {
+                continue;
+            }
+            let Some(accs) = ins["accounts"].as_array() else { continue };
+            let (ia, ib) = if bytes[..8] == DISC_BUY_EXACT_SOL_IN && accs.len() >= 18 {
+                (16usize, 17usize)
+            } else if bytes[..8] == DISC_SELL && accs.len() >= 16 {
+                (14usize, 15usize)
+            } else {
+                continue;
+            };
+            let a = accs[ia].as_str().and_then(|s| Pubkey::from_str(s).ok());
+            let b = accs[ib].as_str().and_then(|s| Pubkey::from_str(s).ok());
+            if let (Some(coin_fee_a), Some(coin_fee_b)) = (a, b) {
+                return Ok(CoinFees { coin_fee_a, coin_fee_b });
+            }
+        }
+    }
+    Err(anyhow!("coin_fee для {mint} не найден (нет свежих buy/sell монеты)"))
+}
+
+/// Собрать `buy_exact_sol_in` ПОЛНОСТЬЮ из деривации (18 аккаунтов) + coin_fee.
+/// data = disc + sol_in:u64 + min_tokens_out:u64 (24 байта, без хвоста).
+pub fn build_buy_exact(
+    payer: &Pubkey,
+    mint: &Pubkey,
+    creator: &Pubkey,
+    coin_token_program: &Pubkey,
+    fees: &CoinFees,
+    sol_in: u64,
+    min_tokens_out: u64,
+) -> Instruction {
+    let accounts = vec![
+        AccountMeta::new_readonly(PUMP_GLOBAL, false),                           // 0
+        AccountMeta::new(PUMP_FEE_RECIPIENT, false),                             // 1
+        AccountMeta::new_readonly(*mint, false),                                 // 2
+        AccountMeta::new(bonding_curve(mint), false),                            // 3
+        AccountMeta::new(assoc_bonding_curve(mint, coin_token_program), false),  // 4
+        AccountMeta::new(ata_with(payer, mint, coin_token_program), false),      // 5
+        AccountMeta::new(*payer, true),                                          // 6 signer
+        AccountMeta::new_readonly(SYSTEM_PROGRAM, false),                        // 7
+        AccountMeta::new_readonly(*coin_token_program, false),                   // 8
+        AccountMeta::new(creator_vault(creator), false),                         // 9
+        AccountMeta::new_readonly(PUMP_EVENT_AUTHORITY, false),                  // 10
+        AccountMeta::new_readonly(PUMP_PROGRAM, false),                          // 11
+        AccountMeta::new(PUMP_GLOBAL_VOLUME_ACC, false),                         // 12
+        AccountMeta::new(user_volume_accumulator(payer), false),                // 13
+        AccountMeta::new_readonly(PUMP_FEE_CONFIG, false),                       // 14
+        AccountMeta::new_readonly(PUMP_FEE_PROGRAM, false),                      // 15
+        AccountMeta::new_readonly(fees.coin_fee_a, false),                       // 16
+        AccountMeta::new(fees.coin_fee_b, false),                                // 17
+    ];
+    let mut data = Vec::with_capacity(24);
+    data.extend_from_slice(&DISC_BUY_EXACT_SOL_IN);
+    data.extend_from_slice(&sol_in.to_le_bytes());
+    data.extend_from_slice(&min_tokens_out.to_le_bytes());
+    Instruction { program_id: PUMP_PROGRAM, accounts, data }
+}
+
+/// Собрать `sell` ПОЛНОСТЬЮ из деривации (16 аккаунтов) + coin_fee.
+/// data = disc + token_amount:u64 + min_sol_out:u64.
+pub fn build_sell_derived(
+    payer: &Pubkey,
+    mint: &Pubkey,
+    creator: &Pubkey,
+    coin_token_program: &Pubkey,
+    fees: &CoinFees,
+    token_amount: u64,
+    min_sol_out: u64,
+) -> Instruction {
+    let accounts = vec![
+        AccountMeta::new_readonly(PUMP_GLOBAL, false),                           // 0
+        AccountMeta::new(PUMP_FEE_RECIPIENT, false),                             // 1
+        AccountMeta::new_readonly(*mint, false),                                 // 2
+        AccountMeta::new(bonding_curve(mint), false),                            // 3
+        AccountMeta::new(assoc_bonding_curve(mint, coin_token_program), false),  // 4
+        AccountMeta::new(ata_with(payer, mint, coin_token_program), false),      // 5
+        AccountMeta::new(*payer, true),                                          // 6 signer
+        AccountMeta::new_readonly(SYSTEM_PROGRAM, false),                        // 7
+        AccountMeta::new(creator_vault(creator), false),                         // 8
+        AccountMeta::new_readonly(*coin_token_program, false),                   // 9
+        AccountMeta::new_readonly(PUMP_EVENT_AUTHORITY, false),                  // 10
+        AccountMeta::new_readonly(PUMP_PROGRAM, false),                          // 11
+        AccountMeta::new_readonly(PUMP_FEE_CONFIG, false),                       // 12
+        AccountMeta::new_readonly(PUMP_FEE_PROGRAM, false),                      // 13
+        AccountMeta::new_readonly(fees.coin_fee_a, false),                       // 14
+        AccountMeta::new(fees.coin_fee_b, false),                                // 15
+    ];
+    let mut data = Vec::with_capacity(24);
+    data.extend_from_slice(&DISC_SELL);
+    data.extend_from_slice(&token_amount.to_le_bytes());
+    data.extend_from_slice(&min_sol_out.to_le_bytes());
+    Instruction { program_id: PUMP_PROGRAM, accounts, data }
+}
+
 // ─────────────────────────── состояние кривой ───────────────────────────
 
 #[derive(Debug, Clone)]

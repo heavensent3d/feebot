@@ -41,6 +41,9 @@ pub const PUMP_EVENT_AUTHORITY: Pubkey = pk("Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjn
 pub const PUMP_FEE_PROGRAM: Pubkey = pk("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ");
 /// global_volume_accumulator / user_volume_accumulator (из live-инструкции).
 pub const PUMP_GLOBAL_VOLUME_ACC: Pubkey = pk("Hq2wp8uJ9jCPsYgNHex8RtqdvMPfVGoYwjvF1ATiwn2Y");
+/// fee_config PDA (["fee_config", PUMP_PROGRAM] под PUMP_FEE_PROGRAM) — константа,
+/// сверена с реальными buy/sail кента (bump 253). Используется билдером напрямую.
+pub const PUMP_FEE_CONFIG: Pubkey = pk("8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt");
 
 /// PumpSwap (pAMM) — торговля уже «выпустившимися» (graduated) монетами.
 pub const PUMPSWAP_PROGRAM: Pubkey = pk("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");

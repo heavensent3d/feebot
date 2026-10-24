@@ -312,11 +312,12 @@ impl Bot {
         let tokens_out = curve.tokens_out_for_sol(buy_lamports);
         let min_tokens = tokens_out - tokens_out * self.cfg.strategy.slippage_bps / 10_000;
 
-        // Шаблон buy_exact_sol_in из свежей реальной tx монеты (fail-safe: нет → скип).
-        let buy_tpl = match pumpfun::fetch_template(&self.rpc, &mint, &pumpfun::DISC_BUY_EXACT_SOL_IN).await {
-            Ok(t) => t,
+        // coin_fee_A/B из свежей реальной buy/sell монеты (остальное деривируем).
+        // Нет свежих buy/sell → монета не торгуется, фисов не будет: скип с кулдауном.
+        let fees = match pumpfun::fetch_coin_fees(&self.rpc, &mint).await {
+            Ok(f) => f,
             Err(e) => {
-                info!("{mint}: нет шаблона buy ({e}) — пропуск позиции (кулдаун {}s)", Self::NO_TEMPLATE_COOLDOWN_SECS);
+                info!("{mint}: нет coin_fee ({e}) — пропуск позиции (кулдаун {}s)", Self::NO_TEMPLATE_COOLDOWN_SECS);
                 self.no_template
                     .lock()
                     .await
@@ -331,13 +332,8 @@ impl Bot {
         let reward_ata_ix = spl_associated_token_account::instruction::create_associated_token_account_idempotent(
             &me, &me, &c.reward_mint, &TOKEN_2022_PROGRAM,
         );
-        let buy_ix = match pumpfun::build_buy_exact_from_template(&buy_tpl, &me, &mint, &coin_tp, buy_lamports, min_tokens) {
-            Ok(ix) => ix,
-            Err(e) => {
-                info!("{mint}: buy-шаблон кривой ({e}) — пропуск");
-                return Ok(());
-            }
-        };
+        // BUY полностью из деривации (18 аккаунтов) + coin_fee. Сверено байт-в-байт.
+        let buy_ix = pumpfun::build_buy_exact(&me, &mint, &creator, &coin_tp, &fees, buy_lamports, min_tokens);
 
         // Гейт входа: «мы ещё не держим эту монету» → из N веерных копий купит одна.
         let coin_ata = pumpfun::ata_with(&me, &mint, &coin_tp);
@@ -394,7 +390,7 @@ impl Bot {
         self.register_exit(&our_reward_ata, &notify).await;
         self.register_exit(&mint, &notify).await;
         let r = self
-            .run_exit(&c, coin_tp, reward_baseline, &our_reward_ata, &notify)
+            .run_exit(&c, coin_tp, creator, &fees, reward_baseline, &our_reward_ata, &notify)
             .await;
         self.deregister_exit(&our_reward_ata, &notify).await;
         self.deregister_exit(&mint, &notify).await;
@@ -473,6 +469,8 @@ impl Bot {
         &self,
         c: &Candidate,
         coin_tp: Pubkey,
+        creator: Pubkey,
+        fees: &pumpfun::CoinFees,
         reward_baseline: u64,
         reward_ata: &Pubkey,
         notify: &Notify,
@@ -515,10 +513,9 @@ impl Bot {
         let spam_slots = self.cfg.strategy.exit_spam_slots;
         let poll = std::time::Duration::from_millis(self.cfg.strategy.poll_ms);
 
-        // sell по шаблону реальной tx монеты (Token-2022). В dry sell_amount=0 → сеть не трогаем.
+        // sell из деривации (16 аккаунтов) + coin_fee. В dry sell_amount=0 → сеть не трогаем.
         let sell_ix = if sell_amount > 0 {
-            let tpl = pumpfun::fetch_template(&self.rpc, &mint, &pumpfun::DISC_SELL).await?;
-            Some(pumpfun::build_sell_from_template(&tpl, &me, &mint, &coin_tp, sell_amount, min_sol_output)?)
+            Some(pumpfun::build_sell_derived(&me, &mint, &creator, &coin_tp, fees, sell_amount, min_sol_output))
         } else {
             None
         };
