@@ -1,10 +1,8 @@
 //! Тонкая обёртка над RpcClient + хелперы чтения состояния.
 
 use anyhow::{anyhow, Result};
-use solana_account_decoder::UiAccountEncoding;
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
-use solana_client::rpc_filter::{Memcmp, RpcFilterType};
 use solana_sdk::account::Account;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::hash::Hash;
@@ -76,39 +74,37 @@ impl Rpc {
     }
 
     /// Все токен-аккаунты владельца под конкретной token-программой.
-    /// Возвращает (адрес аккаунта, mint, amount, decimals).
+    /// Через `getTokenAccountsByOwner` (owner-scoped, лёгкий) — а НЕ
+    /// `getProgramAccounts` (тяжёлый, гейтится на free/Operator RPC и у Helius
+    /// просит getProgramAccountsV2). Возвращает (адрес, mint, amount).
     pub async fn token_accounts(
         &self,
         owner: &Pubkey,
         token_program: &Pubkey,
     ) -> Result<Vec<TokenAccount>> {
-        // filter: SPL token account data size = 165 (классический).
-        // Для token-2022 размер переменный, поэтому фильтруем по owner-memcmp
-        // (offset 32 = owner в token account). Проще — через RPC-метод ниже.
-        let cfg = RpcProgramAccountsConfig {
-            filters: Some(vec![
-                RpcFilterType::Memcmp(Memcmp::new_base58_encoded(32, owner.as_ref())),
-            ]),
-            account_config: RpcAccountInfoConfig {
-                encoding: Some(UiAccountEncoding::Base64),
-                commitment: Some(self.commitment),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let accs = self
-            .client
-            .get_program_accounts_with_config(token_program, cfg)
+        let res = self
+            .raw(
+                "getTokenAccountsByOwner",
+                serde_json::json!([
+                    owner.to_string(),
+                    {"programId": token_program.to_string()},
+                    {"encoding": "base64"}
+                ]),
+            )
             .await?;
-
-        let mut out = Vec::with_capacity(accs.len());
-        for (pubkey, acc) in accs {
-            if let Some(ta) = parse_token_account(&acc.data) {
-                out.push(TokenAccount {
-                    address: pubkey,
-                    mint: ta.0,
-                    amount: ta.1,
-                });
+        let mut out = Vec::new();
+        if let Some(arr) = res["value"].as_array() {
+            for it in arr {
+                let Some(addr) = it["pubkey"].as_str().and_then(|s| Pubkey::from_str(s).ok()) else {
+                    continue;
+                };
+                let Some(data_b64) = it["account"]["data"].get(0).and_then(|d| d.as_str()) else {
+                    continue;
+                };
+                let Ok(data) = B64.decode(data_b64) else { continue };
+                if let Some((mint, amount)) = parse_token_account(&data) {
+                    out.push(TokenAccount { address: addr, mint, amount });
+                }
             }
         }
         Ok(out)
