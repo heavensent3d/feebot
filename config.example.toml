@@ -80,6 +80,7 @@ exit_gate_epsilon = 1         # на сколько должен вырасти 
 entry_gate = true             # Lighthouse-гейт «мой ATA пуст» → защита от двойной покупки
 fanout_entry = false          # веерить вход на все релеи (безопасно при entry_gate=true)
 busy_marker = ".position_open" # маркер «в позиции» для деплой-скрипта (не рестартить посреди сделки)
+exit_bail_on_timeout = true   # раунд не пришёл за exit_spam_slots → продать по рынку (не зависать на мешке)
 # nonce_account = "<durable nonce pubkey>"   # опц., для долгоживущего выхода (feebot init-nonce)
 # tip на вход/выход задаётся per-relay (см. [[relays]]), а не здесь.
 

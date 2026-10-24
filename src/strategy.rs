@@ -629,7 +629,36 @@ impl Bot {
             }
         }
 
-        warn!("EXIT {mint}: гейт не сработал за {spam_slots} слотов — позиция висит, разбирайся вручную");
+        // Гейт не сработал за лимит слотов (раунд не пришёл, пока держали). Чтобы
+        // не зависнуть на мешке — аварийно ПРОДАЁМ по рынку (sell_ix без гейта),
+        // если включено. min_sol_output=0 → примет любую цену (экстренный дамп).
+        if self.cfg.strategy.exit_bail_on_timeout {
+            if let Some(ix) = &sell_ix {
+                warn!("EXIT {mint}: гейт не сработал за {spam_slots} слотов → аварийная продажа по рынку");
+                let mut bail: Vec<Instruction> =
+                    compute_budget(self.cfg.strategy.sell_cu_limit, self.cfg.strategy.sell_cu_price).to_vec();
+                bail.push(ix.clone());
+                for _ in 0..5 {
+                    if let Ok(bh) = self.rpc.latest_blockhash().await {
+                        let _ = self
+                            .relays
+                            .broadcast_build(&self.payer, &bail, bh, &no_alts(), &[])
+                            .await;
+                    }
+                    attempts += 1;
+                    if let Ok(now) = self.rpc.token_amount(&user_ata).await {
+                        if now == 0 || now < bal / 2 {
+                            info!("EXIT {mint}: аварийная продажа прошла (остаток {now})");
+                            return Ok((true, attempts, sell_amount));
+                        }
+                    }
+                    tokio::time::sleep(poll).await;
+                }
+            }
+            warn!("EXIT {mint}: аварийная продажа не прошла — позиция висит, разбирайся вручную");
+        } else {
+            warn!("EXIT {mint}: гейт не сработал за {spam_slots} слотов — позиция висит, разбирайся вручную");
+        }
         Ok((false, attempts, sell_amount))
     }
 

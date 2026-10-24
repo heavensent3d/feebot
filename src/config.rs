@@ -130,6 +130,10 @@ pub struct StrategyConfig {
     /// чтобы не рестартить бота посреди сделки. Путь относительно cwd бота.
     #[serde(default = "default_busy_marker")]
     pub busy_marker: String,
+    /// Если раунд не пришёл за `exit_spam_slots` — аварийно продать монету по
+    /// рынку (БЕЗ гейта), чтобы не зависнуть на мешке. true по умолчанию.
+    #[serde(default = "truev")]
+    pub exit_bail_on_timeout: bool,
 }
 
 fn default_busy_marker() -> String {
