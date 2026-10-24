@@ -31,7 +31,7 @@ use anyhow::{anyhow, Result};
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
@@ -70,6 +70,14 @@ pub struct Bot {
     /// раз (40 getTransaction) и дальше берём из кэша — иначе на каждый тик упираемся
     /// в rate-limit RPC (429 → битые ответы, флап входа).
     coin_fees: Arc<Mutex<HashMap<Pubkey, pumpfun::CoinFees>>>,
+    /// bonding_curve → mint кандидатов (обновляется в tick_entries). Нужно, чтобы по
+    /// шред-событию раунда (где фигурирует кривая) понять, КАКАЯ монета раундилась.
+    curve_to_mint: Arc<Mutex<HashMap<Pubkey, Pubkey>>>,
+    /// mint → времена недавних раундов (из шредов). Частота раундов = сигнал, что
+    /// монета «живая» и раунд придёт, пока держим.
+    round_times: Arc<Mutex<HashMap<Pubkey, VecDeque<std::time::Instant>>>>,
+    /// mint → когда последний раз торговали (кулдаун на повторный вход).
+    recent_trade: Arc<Mutex<HashMap<Pubkey, std::time::Instant>>>,
     /// Будилка цикла входа: шреды будят немедленный опрос борды OTC.
     poll_now: Arc<Notify>,
 }
@@ -102,6 +110,9 @@ impl Bot {
             exit_registry: Arc::new(Mutex::new(HashMap::new())),
             no_template: Arc::new(Mutex::new(HashMap::new())),
             coin_fees: Arc::new(Mutex::new(HashMap::new())),
+            curve_to_mint: Arc::new(Mutex::new(HashMap::new())),
+            round_times: Arc::new(Mutex::new(HashMap::new())),
+            recent_trade: Arc::new(Mutex::new(HashMap::new())),
             poll_now: Arc::new(Notify::new()),
         }
     }
@@ -117,8 +128,9 @@ impl Bot {
     /// Консьюмер шред-потока: раунд по нашему стоку → немедленный выход;
     /// любая активность reward-кошелька → немедленный опрос борды на вход.
     pub async fn consume_shreds(self: Arc<Self>, mut rx: mpsc::Receiver<ShredEvent>) {
-        use crate::programs::OTC_LAUNCHER_REWARDS;
+        use crate::programs::{OTC_LAUNCHER_REWARDS, PUMPSWAP_PROGRAM};
         while let Some(ev) = rx.recv().await {
+            // Будим открытые позиции, чей сток/минт фигурирует в событии (раунд → выход).
             let mut fired = false;
             {
                 let reg = self.exit_registry.lock().await;
@@ -134,11 +146,55 @@ impl Bot {
                 }
             }
             if fired {
-                info!("shred: раунд по нашему стоку в slot={} → триггер выхода", ev.slot);
+                info!("shred: раунд по нашей монете/стоку slot={} → триггер выхода", ev.slot);
             }
+            // РАУНД OTC = событие кошелька раздачи + pAMM-своп (ревард→сток). По кривой
+            // в аккаунтах понимаем, КАКАЯ монета раундилась, и копим частоту раундов.
             if ev.touches(&OTC_LAUNCHER_REWARDS) {
+                if ev.uses_program(&PUMPSWAP_PROGRAM) {
+                    let c2m = self.curve_to_mint.lock().await;
+                    if !c2m.is_empty() {
+                        for acc in &ev.accounts {
+                            if let Some(mint) = c2m.get(acc) {
+                                let mint = *mint;
+                                drop(c2m);
+                                self.record_round(&mint).await;
+                                break;
+                            }
+                        }
+                    }
+                }
                 self.poll_now.notify_one();
             }
+        }
+    }
+
+    /// Записать раунд монеты (для частоты). Чистим старые (> round_window_secs).
+    async fn record_round(&self, mint: &Pubkey) {
+        let window = std::time::Duration::from_secs(self.cfg.strategy.round_window_secs);
+        let now = std::time::Instant::now();
+        let mut rt = self.round_times.lock().await;
+        let dq = rt.entry(*mint).or_default();
+        dq.push_back(now);
+        while dq.front().map(|t| now.duration_since(*t) > window).unwrap_or(false) {
+            dq.pop_front();
+        }
+        info!("shred: раунд монеты {mint} (всего в окне: {})", dq.len());
+    }
+
+    /// Сколько раундов у монеты в окне round_window_secs.
+    async fn rounds_in_window(&self, mint: &Pubkey) -> usize {
+        let window = std::time::Duration::from_secs(self.cfg.strategy.round_window_secs);
+        let now = std::time::Instant::now();
+        let mut rt = self.round_times.lock().await;
+        match rt.get_mut(mint) {
+            Some(dq) => {
+                while dq.front().map(|t| now.duration_since(*t) > window).unwrap_or(false) {
+                    dq.pop_front();
+                }
+                dq.len()
+            }
+            None => 0,
         }
     }
 
@@ -208,8 +264,20 @@ impl Bot {
             return Ok(());
         }
         let cands = self.oracle.candidates().await?;
+        // Обновляем карту кривая→mint по ВСЕМ кандидатам, чтобы шред-консьюмер мог
+        // по событию раунда опознать монету и копить частоту раундов.
+        {
+            let mut c2m = self.curve_to_mint.lock().await;
+            *c2m = cands
+                .iter()
+                .map(|c| (pumpfun::bonding_curve(&c.mint), c.mint))
+                .collect();
+        }
         let sol_price = self.sol_price_usd().await;
         let buy_sol = self.cfg.strategy.buy_sol;
+        let min_rounds = self.cfg.strategy.min_rounds_in_window;
+        let max_float = self.cfg.strategy.max_qualified_float_usd;
+        let cooldown = self.cfg.strategy.post_trade_cooldown_secs;
         let mut considered = 0usize;
         for c in cands {
             // Нет свободного слота — дальше перебирать незачем.
@@ -218,6 +286,20 @@ impl Bot {
             }
             // Уже держим этот мемкоин.
             if self.active.lock().await.contains(&c.mint) {
+                continue;
+            }
+            // Кулдаун на повторный вход в только что проторгованную монету.
+            {
+                let rtd = self.recent_trade.lock().await;
+                if let Some(t) = rtd.get(&c.mint) {
+                    if t.elapsed().as_secs() < cooldown {
+                        continue;
+                    }
+                }
+            }
+            // ГЛАВНЫЙ гейт модели: монета должна АКТИВНО раундиться (иначе раунд не
+            // придёт, пока держим — именно на этом бот сливал). Дёшево, из памяти.
+            if self.rounds_in_window(&c.mint).await < min_rounds {
                 continue;
             }
             // Недавно у этой монеты не нашли buy-шаблон — пропускаем на кулдаун,
@@ -237,6 +319,12 @@ impl Bot {
             }
             // Реальный он-чейн флоат только для прошедших прескрин (экономим RPC).
             let float_override = self.float_override(&c, sol_price).await;
+            // Эдж = КРОШЕЧНЫЙ флоат (наша доля большая). Над порогом доля мелкая → скип.
+            if let Some(f) = float_override {
+                if f > max_float {
+                    continue;
+                }
+            }
             match self.filters.evaluate(&c, buy_sol, sol_price, float_override) {
                 Verdict::Skip(_reason) => continue,
                 Verdict::Take => {}
@@ -271,6 +359,8 @@ impl Bot {
                 if let Err(e) = me.run_position(c).await {
                     warn!("позиция {mint}: {e:#}");
                 }
+                // Кулдаун на повторный вход (не перезаходить сразу в ту же монету).
+                me.recent_trade.lock().await.insert(mint, std::time::Instant::now());
                 me.active_reward_mints.lock().await.remove(&reward_mint);
                 me.active.lock().await.remove(&mint);
             });
@@ -516,14 +606,6 @@ impl Bot {
         let threshold = reward_baseline.saturating_add(self.cfg.strategy.exit_gate_epsilon);
         let gate = self.cfg.strategy.lighthouse_exit_gate;
 
-        let nonce_pk = self
-            .cfg
-            .strategy
-            .nonce_account
-            .as_deref()
-            .and_then(|s| Pubkey::from_str(s).ok());
-
-        let spam_slots = self.cfg.strategy.exit_spam_slots;
         let poll = std::time::Duration::from_millis(self.cfg.strategy.poll_ms);
 
         // sell из деривации (16 аккаунтов) + coin_fee. В dry sell_amount=0 → сеть не трогаем.
@@ -533,132 +615,74 @@ impl Bot {
             None
         };
 
-        // Сборщик инструкций выхода. advance=Some → durable nonce (ПЕРВОЙ инструкцией).
-        let build_ixs = |advance: Option<(Pubkey, Pubkey)>| -> Vec<Instruction> {
-            let mut ixs: Vec<Instruction> = Vec::new();
-            if let Some((npk, auth)) = advance {
-                ixs.push(nonce::advance_ix(&npk, &auth));
-            }
-            ixs.extend(
-                compute_budget(self.cfg.strategy.sell_cu_limit, self.cfg.strategy.sell_cu_price)
-                    .to_vec(),
+        if self.cfg.strategy.dry_run {
+            info!(
+                "[DRY] HOLD {mint}: держим до раунда (≤{}s), гейт reward(ourReward {reward_ata})≥{threshold}, продать {sell_amount} токенов",
+                self.cfg.strategy.hold_max_secs
             );
-            // Гейт на НАШ ATA стока: нам начислили ⇒ раунд нас зачёл ⇒ можно дампить.
-            if gate {
+            return Ok((false, 0, sell_amount));
+        }
+
+        // ── ХОЛД ДО РАУНДА ──
+        // Раунды OTC атомарны (своп+раздача в одной tx) — влезть в гэп нельзя, надо
+        // быть холдером ДО раунда. Поэтому ДЕРЖИМ монету и ждём, пока раунд начислит
+        // сток на наш reward-ATA (shred-будилка + дешёвый опрос). Как начислил —
+        // продаём (реворд уже у нас). Истёк бюджет холда → бейл по рынку.
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(self.cfg.strategy.hold_max_secs);
+        let mut attempts = 0u64;
+        let mut got_reward = false;
+        while std::time::Instant::now() < deadline {
+            tokio::select! {
+                _ = notify.notified() => {}
+                _ = tokio::time::sleep(poll) => {}
+            }
+            let reward_now = self.rpc.token_amount(reward_ata).await.unwrap_or(reward_baseline);
+            if reward_now >= threshold {
+                got_reward = true;
+                info!("EXIT {mint}: раунд начислил сток ({reward_now}≥{threshold}) → продаём монету");
+                break;
+            }
+        }
+
+        // Реворд пришёл → gated sell (гейт пройдёт, он уже у нас). Бюджет истёк без
+        // реворда → бейл по рынку (без гейта), если включено.
+        let use_gate = got_reward && gate;
+        if !got_reward {
+            if !self.cfg.strategy.exit_bail_on_timeout {
+                warn!("EXIT {mint}: за {}s раунд не пришёл, bail выключен — позиция висит, разбирайся вручную", self.cfg.strategy.hold_max_secs);
+                return Ok((false, attempts, sell_amount));
+            }
+            warn!("EXIT {mint}: за {}s раунд не пришёл → продаём по рынку (бейл, в убыток)", self.cfg.strategy.hold_max_secs);
+        }
+        for _ in 0..15 {
+            let mut ixs: Vec<Instruction> =
+                compute_budget(self.cfg.strategy.sell_cu_limit, self.cfg.strategy.sell_cu_price).to_vec();
+            if use_gate {
                 ixs.push(assert_token_amount(reward_ata, threshold, Op::Gte));
             }
             if let Some(ix) = &sell_ix {
                 ixs.push(ix.clone());
             }
-            ixs
-        };
-
-        if self.cfg.strategy.dry_run {
-            info!(
-                "[DRY] EXIT {mint}: гейт amount(ourReward {reward_ata})≥{threshold}, продать {sell_amount} токенов (nonce={})",
-                nonce_pk.is_some()
-            );
-            return Ok((false, 0, sell_amount));
-        }
-
-        let mut attempts = 0u64;
-
-        // ── durable nonce: подписываем ОДИН РАЗ, спамим кэш ──
-        if let Some(npk) = nonce_pk {
-            let nd = nonce::read_nonce(&self.rpc, &npk).await?;
-            // Выход подписывает только payer; если authority nonce другой — tx не
-            // соберётся. Требуем authority == payer (так делает `feebot init-nonce`).
-            if nd.authority != me {
-                return Err(anyhow!(
-                    "nonce authority {} != payer {me} — пересоздай nonce с authority=payer (feebot init-nonce)",
-                    nd.authority
-                ));
-            }
-            let ixs = build_ixs(Some((npk, nd.authority)));
-            let cached = self
-                .relays
-                .build_cached(&self.payer, &ixs, nd.blockhash, &no_alts(), &[])?;
-            for round in 0..spam_slots {
-                match self.relays.send_cached(&cached).await {
-                    Ok(sig) if round % 10 == 0 => info!("EXIT {mint} nonce-спам #{round}: {sig}"),
-                    Ok(_) => {}
-                    Err(e) => warn!("EXIT {mint} отправка: {e}"),
-                }
-                attempts += 1;
-                if let Ok(now) = self.rpc.token_amount(&user_ata).await {
-                    if now == 0 || now < bal / 2 {
-                        info!("EXIT {mint}: позиция закрыта (остаток {now})");
-                        return Ok((true, attempts, sell_amount));
-                    }
-                }
-                tokio::select! {
-                    _ = notify.notified() => {}
-                    _ = tokio::time::sleep(poll) => {}
-                }
-            }
-        } else {
-            // ── свежий blockhash: переподписываем, blockhash обновляем раз в ~20 итераций ──
-            let mut bh = self.rpc.latest_blockhash().await?;
-            for round in 0..spam_slots {
-                if round > 0 && round % 20 == 0 {
-                    if let Ok(h) = self.rpc.latest_blockhash().await {
-                        bh = h;
-                    }
-                }
-                let ixs = build_ixs(None);
-                match self
+            if let Ok(bh) = self.rpc.latest_blockhash().await {
+                if let Err(e) = self
                     .relays
                     .broadcast_build(&self.payer, &ixs, bh, &no_alts(), &[])
                     .await
                 {
-                    Ok(sig) if round % 10 == 0 => info!("EXIT {mint} спам #{round}: {sig}"),
-                    Ok(_) => {}
-                    Err(e) => warn!("EXIT {mint} отправка: {e}"),
-                }
-                attempts += 1;
-                if let Ok(now) = self.rpc.token_amount(&user_ata).await {
-                    if now == 0 || now < bal / 2 {
-                        info!("EXIT {mint}: позиция закрыта (остаток {now})");
-                        return Ok((true, attempts, sell_amount));
-                    }
-                }
-                tokio::select! {
-                    _ = notify.notified() => {}
-                    _ = tokio::time::sleep(poll) => {}
+                    warn!("EXIT {mint} продажа: {e}");
                 }
             }
-        }
-
-        // Гейт не сработал за лимит слотов (раунд не пришёл, пока держали). Чтобы
-        // не зависнуть на мешке — аварийно ПРОДАЁМ по рынку (sell_ix без гейта),
-        // если включено. min_sol_output=0 → примет любую цену (экстренный дамп).
-        if self.cfg.strategy.exit_bail_on_timeout {
-            if let Some(ix) = &sell_ix {
-                warn!("EXIT {mint}: гейт не сработал за {spam_slots} слотов → аварийная продажа по рынку");
-                let mut bail: Vec<Instruction> =
-                    compute_budget(self.cfg.strategy.sell_cu_limit, self.cfg.strategy.sell_cu_price).to_vec();
-                bail.push(ix.clone());
-                for _ in 0..5 {
-                    if let Ok(bh) = self.rpc.latest_blockhash().await {
-                        let _ = self
-                            .relays
-                            .broadcast_build(&self.payer, &bail, bh, &no_alts(), &[])
-                            .await;
-                    }
-                    attempts += 1;
-                    if let Ok(now) = self.rpc.token_amount(&user_ata).await {
-                        if now == 0 || now < bal / 2 {
-                            info!("EXIT {mint}: аварийная продажа прошла (остаток {now})");
-                            return Ok((true, attempts, sell_amount));
-                        }
-                    }
-                    tokio::time::sleep(poll).await;
+            attempts += 1;
+            if let Ok(now) = self.rpc.token_amount(&user_ata).await {
+                if now == 0 || now < bal / 2 {
+                    info!("EXIT {mint}: монета продана (остаток {now}, реворд={got_reward})");
+                    return Ok((true, attempts, sell_amount));
                 }
             }
-            warn!("EXIT {mint}: аварийная продажа не прошла — позиция висит, разбирайся вручную");
-        } else {
-            warn!("EXIT {mint}: гейт не сработал за {spam_slots} слотов — позиция висит, разбирайся вручную");
+            tokio::time::sleep(poll).await;
         }
+        warn!("EXIT {mint}: продажа не прошла за 15 попыток — позиция висит, разбирайся вручную");
         Ok((false, attempts, sell_amount))
     }
 

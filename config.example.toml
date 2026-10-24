@@ -80,7 +80,13 @@ exit_gate_epsilon = 1         # на сколько должен вырасти 
 entry_gate = true             # Lighthouse-гейт «мой ATA пуст» → защита от двойной покупки
 fanout_entry = false          # веерить вход на все релеи (безопасно при entry_gate=true)
 busy_marker = ".position_open" # маркер «в позиции» для деплой-скрипта (не рестартить посреди сделки)
-exit_bail_on_timeout = true   # раунд не пришёл за exit_spam_slots → продать по рынку (не зависать на мешке)
+exit_bail_on_timeout = true   # раунд не пришёл за hold_max_secs → продать по рынку (не зависать на мешке)
+# ── модель «холд до раунда» (раунды OTC атомарны — быть холдером ДО раунда) ──
+max_qualified_float_usd = 400 # входим только в монеты с КРОШЕЧНЫМ флоатом (наша доля велика)
+round_window_secs = 600       # окно подсчёта раундов монеты
+min_rounds_in_window = 1      # мин. раундов в окне, чтобы войти (монета активно раундится)
+hold_max_secs = 300           # макс. холд в ожидании раунда; истёк без реворда → бейл
+post_trade_cooldown_secs = 120 # не перезаходить в ту же монету сразу после сделки
 # nonce_account = "<durable nonce pubkey>"   # опц., для долгоживущего выхода (feebot init-nonce)
 # tip на вход/выход задаётся per-relay (см. [[relays]]), а не здесь.
 

@@ -130,10 +130,45 @@ pub struct StrategyConfig {
     /// чтобы не рестартить бота посреди сделки. Путь относительно cwd бота.
     #[serde(default = "default_busy_marker")]
     pub busy_marker: String,
-    /// Если раунд не пришёл за `exit_spam_slots` — аварийно продать монету по
-    /// рынку (БЕЗ гейта), чтобы не зависнуть на мешке. true по умолчанию.
+    /// Если раунд не пришёл за время холда — аварийно продать монету по рынку
+    /// (БЕЗ гейта), чтобы не зависнуть на мешке. true по умолчанию.
     #[serde(default = "truev")]
     pub exit_bail_on_timeout: bool,
+    /// ── Модель «холд до раунда» (раунды OTC атомарны, влезть в гэп нельзя —
+    /// надо быть холдером ДО раунда и ловить раунды, пока держим) ──
+    /// Макс. qualified-флоат монеты (USD), чтобы наша доля была большой. Над этим
+    /// порогом вход невыгоден (доля мелкая). ~$400 по умолчанию (эдж = крошечный флоат).
+    #[serde(default = "default_max_float_usd")]
+    pub max_qualified_float_usd: f64,
+    /// Окно (сек), в котором считаем раунды монеты, чтобы понять что она «живая»
+    /// (раунд придёт, пока держим).
+    #[serde(default = "default_round_window_secs")]
+    pub round_window_secs: u64,
+    /// Минимум раундов монеты в окне, чтобы в неё входить (активный раундер).
+    #[serde(default = "default_min_rounds")]
+    pub min_rounds_in_window: usize,
+    /// Макс. время холда (сек) в ожидании раунда; истекло без реворда → бейл.
+    #[serde(default = "default_hold_max_secs")]
+    pub hold_max_secs: u64,
+    /// Кулдаун (сек) на повторный вход в ту же монету после сделки.
+    #[serde(default = "default_post_trade_cooldown")]
+    pub post_trade_cooldown_secs: u64,
+}
+
+fn default_max_float_usd() -> f64 {
+    400.0
+}
+fn default_round_window_secs() -> u64 {
+    600
+}
+fn default_min_rounds() -> usize {
+    1
+}
+fn default_hold_max_secs() -> u64 {
+    300
+}
+fn default_post_trade_cooldown() -> u64 {
+    120
 }
 
 fn default_busy_marker() -> String {
