@@ -149,6 +149,19 @@ impl Reporter {
         info!("тестовое сообщение отправлено в Telegram");
     }
 
+    /// Уведомление о старте/рестарте бота (режим, кошелёк, баланс, размер входа).
+    pub async fn report_startup(&self, wallet: &str, balance_sol: f64, dry_run: bool, buy_sol: f64) {
+        let mode = if dry_run {
+            "🧪 DRY-RUN (транзакции НЕ шлёт)"
+        } else {
+            "🟢 LIVE (реальные сделки)"
+        };
+        let text = format!(
+            "♻️ <b>feebot запущен</b>\nРежим: {mode}\nКошелёк: <code>{wallet}</code>\nБаланс: {balance_sol:.4} SOL\nРазмер входа: {buy_sol} SOL"
+        );
+        self.send_telegram(&text).await;
+    }
+
     fn append_journal(&self, r: &TradeReport) {
         if self.cfg.journal_path.is_empty() {
             return;

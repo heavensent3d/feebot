@@ -393,6 +393,14 @@ async fn run_loops(
     }
 
     info!("feebot запущен. Ctrl+C для остановки.");
+    // Уведомление в Telegram о старте/рестарте (баланс читаем из RPC).
+    {
+        let wallet = payer.pubkey();
+        let bal = rpc.lamports(&wallet).await.unwrap_or(0) as f64 / 1e9;
+        bot.reporter
+            .report_startup(&wallet.to_string(), bal, bot.cfg.strategy.dry_run, bot.cfg.strategy.buy_sol)
+            .await;
+    }
     tokio::signal::ctrl_c().await?;
     info!("останавливаюсь");
     Ok(())
