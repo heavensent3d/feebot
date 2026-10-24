@@ -35,7 +35,14 @@ impl Rpc {
     pub async fn raw(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
         let body = serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":params});
         let resp = self.rq.post(&self.http_url).json(&body).send().await?;
-        let v: serde_json::Value = resp.json().await?;
+        let status = resp.status();
+        // Читаем текст и парсим вручную: на rate-limit/ошибке RPC отдаёт не-JSON
+        // (HTML/пусто), и resp.json() падал опаковым "error decoding response body".
+        let text = resp.text().await?;
+        let v: serde_json::Value = serde_json::from_str(&text).map_err(|_| {
+            let snip: String = text.chars().take(120).collect();
+            anyhow!("rpc {method}: не-JSON ответ (HTTP {status}): {snip}")
+        })?;
         if let Some(e) = v.get("error") {
             return Err(anyhow!("rpc {method}: {e}"));
         }

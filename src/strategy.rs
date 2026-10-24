@@ -66,6 +66,10 @@ pub struct Bot {
     /// кулдаун и пробуем ДРУГИХ кандидатов (иначе одна дохлая монета в топе
     /// борды застревает и блокирует входы). mint → когда отметили.
     no_template: Arc<Mutex<HashMap<Pubkey, std::time::Instant>>>,
+    /// Кэш coin_fee_A/B по монете: они стабильны per-coin, поэтому скрейпим ОДИН
+    /// раз (40 getTransaction) и дальше берём из кэша — иначе на каждый тик упираемся
+    /// в rate-limit RPC (429 → битые ответы, флап входа).
+    coin_fees: Arc<Mutex<HashMap<Pubkey, pumpfun::CoinFees>>>,
     /// Будилка цикла входа: шреды будят немедленный опрос борды OTC.
     poll_now: Arc<Notify>,
 }
@@ -97,6 +101,7 @@ impl Bot {
             sol_price: Arc::new(Mutex::new((0.0, std::time::Instant::now()))),
             exit_registry: Arc::new(Mutex::new(HashMap::new())),
             no_template: Arc::new(Mutex::new(HashMap::new())),
+            coin_fees: Arc::new(Mutex::new(HashMap::new())),
             poll_now: Arc::new(Notify::new()),
         }
     }
@@ -313,17 +318,25 @@ impl Bot {
         let min_tokens = tokens_out - tokens_out * self.cfg.strategy.slippage_bps / 10_000;
 
         // coin_fee_A/B из свежей реальной buy/sell монеты (остальное деривируем).
-        // Нет свежих buy/sell → монета не торгуется, фисов не будет: скип с кулдауном.
-        let fees = match pumpfun::fetch_coin_fees(&self.rpc, &mint).await {
-            Ok(f) => f,
-            Err(e) => {
-                info!("{mint}: нет coin_fee ({e}) — пропуск позиции (кулдаун {}s)", Self::NO_TEMPLATE_COOLDOWN_SECS);
-                self.no_template
-                    .lock()
-                    .await
-                    .insert(mint, std::time::Instant::now());
-                return Ok(());
-            }
+        // Кэшируем per-coin: нет свежих buy/sell → монета не торгуется, фисов не
+        // будет, скип с кулдауном.
+        let cached = self.coin_fees.lock().await.get(&mint).copied();
+        let fees = match cached {
+            Some(f) => f,
+            None => match pumpfun::fetch_coin_fees(&self.rpc, &mint).await {
+                Ok(f) => {
+                    self.coin_fees.lock().await.insert(mint, f);
+                    f
+                }
+                Err(e) => {
+                    info!("{mint}: нет coin_fee ({e}) — пропуск позиции (кулдаун {}s)", Self::NO_TEMPLATE_COOLDOWN_SECS);
+                    self.no_template
+                        .lock()
+                        .await
+                        .insert(mint, std::time::Instant::now());
+                    return Ok(());
+                }
+            },
         };
         // ATA мемкоина (его token-программа) + ATA reward-стока (Token-2022).
         let coin_ata_ix = spl_associated_token_account::instruction::create_associated_token_account_idempotent(
