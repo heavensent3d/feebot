@@ -129,7 +129,7 @@ pub async fn fetch_template(rpc: &Rpc, mint: &Pubkey, disc: &[u8; 8]) -> Result<
         let tx = match rpc
             .raw(
                 "getTransaction",
-                serde_json::json!([sig, {"encoding":"jsonParsed","maxSupportedTransactionVersion":1}]),
+                serde_json::json!([sig, {"encoding":"jsonParsed","maxSupportedTransactionVersion":0}]),
             )
             .await
         {

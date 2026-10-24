@@ -62,6 +62,10 @@ pub struct Bot {
     /// reward_token_account → будилки открытых позиций, платящих этим стоком.
     /// Шред-поток дёргает их в момент раунда → мгновенный выход.
     exit_registry: Arc<Mutex<HashMap<Pubkey, Vec<Arc<Notify>>>>>,
+    /// Монеты, у которых не нашли buy-шаблон → не долбим их каждый тик, даём
+    /// кулдаун и пробуем ДРУГИХ кандидатов (иначе одна дохлая монета в топе
+    /// борды застревает и блокирует входы). mint → когда отметили.
+    no_template: Arc<Mutex<HashMap<Pubkey, std::time::Instant>>>,
     /// Будилка цикла входа: шреды будят немедленный опрос борды OTC.
     poll_now: Arc<Notify>,
 }
@@ -92,9 +96,13 @@ impl Bot {
             active_reward_mints: Arc::new(Mutex::new(HashSet::new())),
             sol_price: Arc::new(Mutex::new((0.0, std::time::Instant::now()))),
             exit_registry: Arc::new(Mutex::new(HashMap::new())),
+            no_template: Arc::new(Mutex::new(HashMap::new())),
             poll_now: Arc::new(Notify::new()),
         }
     }
+
+    /// Кулдаун для монеты без найденного buy-шаблона (сек).
+    const NO_TEMPLATE_COOLDOWN_SECS: u64 = 180;
 
     /// Будилка цикла входа (её дёргает шред-консьюмер).
     pub fn poll_now(&self) -> Arc<Notify> {
@@ -207,6 +215,17 @@ impl Bot {
             if self.active.lock().await.contains(&c.mint) {
                 continue;
             }
+            // Недавно у этой монеты не нашли buy-шаблон — пропускаем на кулдаун,
+            // чтобы перейти к другим кандидатам, а не застревать на ней.
+            {
+                let mut nt = self.no_template.lock().await;
+                if let Some(t) = nt.get(&c.mint) {
+                    if t.elapsed().as_secs() < Self::NO_TEMPLATE_COOLDOWN_SECS {
+                        continue;
+                    }
+                    nt.remove(&c.mint); // кулдаун истёк — дадим ещё шанс
+                }
+            }
             // Дешёвый прескрин без RPC.
             if matches!(self.filters.prescreen(&c), Verdict::Skip(_)) {
                 continue;
@@ -306,7 +325,11 @@ impl Bot {
         let buy_tpl = match pumpfun::fetch_template(&self.rpc, &mint, &pumpfun::DISC_BUY_EXACT_SOL_IN).await {
             Ok(t) => t,
             Err(e) => {
-                info!("{mint}: нет шаблона buy ({e}) — пропуск позиции");
+                info!("{mint}: нет шаблона buy ({e}) — пропуск позиции (кулдаун {}s)", Self::NO_TEMPLATE_COOLDOWN_SECS);
+                self.no_template
+                    .lock()
+                    .await
+                    .insert(mint, std::time::Instant::now());
                 return Ok(());
             }
         };
