@@ -256,7 +256,6 @@ impl Bot {
             considered += 1;
             // Пометить активной и запустить позицию в отдельной задаче.
             self.active.lock().await.insert(c.mint);
-            self.set_busy(true); // ≥1 позиция открыта → маркер для деплой-скрипта
             let me = Arc::clone(self);
             tokio::spawn(async move {
                 // Пермит живёт до конца позиции → слот освобождается только после
@@ -268,15 +267,7 @@ impl Bot {
                     warn!("позиция {mint}: {e:#}");
                 }
                 me.active_reward_mints.lock().await.remove(&reward_mint);
-                // Снимаем маркер «в позиции» только когда флэт (под тем же локом,
-                // чтобы не было гонки с открытием новой позиции).
-                {
-                    let mut a = me.active.lock().await;
-                    a.remove(&mint);
-                    if a.is_empty() {
-                        me.set_busy(false);
-                    }
-                }
+                me.active.lock().await.remove(&mint);
             });
         }
         if considered > 0 {
@@ -388,6 +379,10 @@ impl Bot {
                     .await?
             };
             info!("BUY {mint} отправлен: {sig}");
+            // Реально вошли → маркер «в позиции»: деплой-скрипт не рестартит
+            // бота, пока мы держим монету (иначе осиротит спам-выход). В dry
+            // сюда не попадаем, поэтому dry-рестарты всегда свободны.
+            self.set_busy(true);
             // Филл дожидается сам run_exit (ретраями), чтобы медленный вход
             // не осиротил позицию без управляющего цикла.
         }
@@ -403,6 +398,8 @@ impl Bot {
             .await;
         self.deregister_exit(&our_reward_ata, &notify).await;
         self.deregister_exit(&mint, &notify).await;
+        // Позиция закрыта/сдались → снимаем маркер (no-op в dry, где не ставили).
+        self.set_busy(false);
         let (closed, attempts, sell_amount) = r?;
         if closed && !self.cfg.strategy.dry_run {
             self.emit_report(&c, &curve, &our_reward_ata, reward_baseline, sell_amount, attempts)
