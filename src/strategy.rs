@@ -320,12 +320,13 @@ impl Bot {
             // Догружаем rewards (owed / distributed / lastPaidHolders) — объект приходит
             // ТОЛЬКО из /api/coins?mint=X. Это и есть сигналы отбора: платит ли монета
             // реально и на скольких холдеров делится выплата.
-            if let Some((owed, distributed, paid_holders)) =
+            if let Some((owed, distributed, paid_holders, payout_age)) =
                 self.oracle.enrich_rewards(&c.mint).await
             {
                 c.owed_sol = Some(owed);
                 c.distributed_sol = Some(distributed);
                 c.last_paid_holders = Some(paid_holders);
+                c.last_payout_age_secs = payout_age;
             }
             // Прескрин ещё раз — теперь с rewards-гейтами (роздано / холдеры / обвал).
             if let Verdict::Skip(_r) = self.filters.prescreen(&c) {

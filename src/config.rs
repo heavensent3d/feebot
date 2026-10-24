@@ -224,6 +224,9 @@ fn default_max_drop_24h() -> f64 {
 fn default_max_drop() -> f64 {
     default_max_drop_24h()
 }
+fn default_max_payout_age() -> u64 {
+    1800 // 30 минут: монета должна раздавать ПРЯМО СЕЙЧАС
+}
 fn default_round_window_secs() -> u64 {
     600
 }
@@ -307,6 +310,11 @@ pub struct FilterConfig {
     /// Не входить, если цена за 24ч упала сильнее (%, отрицательное). 0 = выключено.
     #[serde(default = "default_max_drop")]
     pub max_drop_24h_pct: f64,
+    /// Максимальный возраст ПОСЛЕДНЕЙ раздачи (сек). Монета с отличной историей,
+    /// но не раздававшая часы — мертва: раунда за наш холд не будет. Это главный
+    /// фильтр «живости», без него покупаются мёртвые монеты.
+    #[serde(default = "default_max_payout_age")]
+    pub max_last_payout_age_secs: u64,
     /// Накопленная доля держателей (SOL) должна быть не ниже — раунд близко.
     #[serde(default = "default_min_pending")]
     pub min_pending_reward_sol: f64,
@@ -369,6 +377,7 @@ impl Default for FilterConfig {
             max_last_paid_holders: default_max_paid_holders(),
             min_owed_sol: default_min_owed(),
             max_drop_24h_pct: default_max_drop(),
+            max_last_payout_age_secs: default_max_payout_age(),
             reward_mint_denylist: vec![],
             reward_mint_allowlist: vec![],
         }

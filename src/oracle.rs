@@ -34,6 +34,9 @@ pub struct Candidate {
     pub distributed_sol: Option<f64>,
     /// Сколько холдеров делили последнюю выплату — прокси флоата (меньше = наша доля больше).
     pub last_paid_holders: Option<u64>,
+    /// Сколько секунд назад была ПОСЛЕДНЯЯ раздача. Критично: монета с отличной
+    /// историей, но раздававшая 17 часов назад — мёртвая, раунда за наш холд не будет.
+    pub last_payout_age_secs: Option<u64>,
 }
 
 pub struct Oracle {
@@ -54,14 +57,24 @@ impl Oracle {
 
     /// Догрузить `rewards` по монете (owed / distributed / lastPaidHolders).
     /// Отдельный per-coin запрос — дёргаем только для прошедших дешёвый прескрин.
-    /// Возвращает (owed_sol, distributed_sol, last_paid_holders).
-    pub async fn enrich_rewards(&self, mint: &Pubkey) -> Option<(f64, f64, u64)> {
+    /// Возвращает (owed_sol, distributed_sol, last_paid_holders, last_payout_age_secs).
+    pub async fn enrich_rewards(&self, mint: &Pubkey) -> Option<(f64, f64, u64, Option<u64>)> {
         let c = self.otc.coin_detail(&mint.to_string()).await.ok()?;
         let r = c.rewards?;
+        let age = if r.last_distributed_at > 0 {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            Some(now.saturating_sub(r.last_distributed_at))
+        } else {
+            None
+        };
         Some((
             r.owed as f64 / 1e9,
             r.distributed as f64 / 1e9,
             r.last_paid_holders,
+            age,
         ))
     }
 
@@ -113,6 +126,7 @@ impl Oracle {
                 owed_sol: c.rewards.as_ref().map(|r| r.owed as f64 / 1e9),
                 distributed_sol: c.rewards.as_ref().map(|r| r.distributed as f64 / 1e9),
                 last_paid_holders: c.rewards.as_ref().map(|r| r.last_paid_holders),
+                last_payout_age_secs: None,
             });
         }
         Ok(out)

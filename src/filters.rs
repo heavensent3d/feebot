@@ -76,6 +76,19 @@ impl Filters {
                 ));
             }
         }
+        // СВЕЖЕСТЬ РАЗДАЧ — критично. Монета может иметь отличную историю
+        // (роздано много, холдеров мало), но если последняя раздача была часы
+        // назад — она мертва, и раунда за наш холд не случится. Именно на этом
+        // мы купили мешок, который 17 часов не платил.
+        if let Some(age) = c.last_payout_age_secs {
+            if age > self.cfg.max_last_payout_age_secs {
+                return Verdict::Skip(format!(
+                    "последняя раздача {} мин назад > max {} мин (монета не раздаёт)",
+                    age / 60,
+                    self.cfg.max_last_payout_age_secs / 60
+                ));
+            }
+        }
         // Чем меньше холдеров делили выплату — тем больше НАША доля. Это сам эдж.
         if let Some(h) = c.last_paid_holders {
             if h > self.cfg.max_last_paid_holders {
