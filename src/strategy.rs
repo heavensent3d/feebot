@@ -653,17 +653,53 @@ impl Bot {
             + std::time::Duration::from_secs(self.cfg.strategy.hold_max_secs);
         let mut attempts = 0u64;
         let mut got_reward = false;
-        while std::time::Instant::now() < deadline {
-            tokio::select! {
-                _ = notify.notified() => {}
-                _ = tokio::time::sleep(poll) => {}
+        let mut rewards_collected = 0u32;
+        // Порог «следующего» реворда: после каждого полученного сдвигаем выше,
+        // чтобы ждать именно НОВЫЙ раунд, а не видеть старый баланс.
+        let mut next_threshold = threshold;
+        'hold: loop {
+            let mut hit = false;
+            while std::time::Instant::now() < deadline {
+                tokio::select! {
+                    _ = notify.notified() => {}
+                    _ = tokio::time::sleep(poll) => {}
+                }
+                let reward_now = self.rpc.token_amount(reward_ata).await.unwrap_or(reward_baseline);
+                if reward_now >= next_threshold {
+                    got_reward = true;
+                    rewards_collected += 1;
+                    hit = true;
+                    info!(
+                        "EXIT {mint}: реворд #{rewards_collected} начислен ({reward_now}≥{next_threshold})"
+                    );
+                    next_threshold = reward_now.saturating_add(self.cfg.strategy.exit_gate_epsilon);
+                    break;
+                }
             }
-            let reward_now = self.rpc.token_amount(reward_ata).await.unwrap_or(reward_baseline);
-            if reward_now >= threshold {
-                got_reward = true;
-                info!("EXIT {mint}: раунд начислил сток ({reward_now}≥{threshold}) → продаём монету");
-                break;
+            if !hit {
+                break 'hold; // дедлайн без реворда
             }
+            // Риск отбит ревордом: если позиция уже в хорошем плюсе — НЕ продаём,
+            // ждём следующий раунд (ещё реворд + возможный рост монеты).
+            if rewards_collected < self.cfg.strategy.max_rewards_per_hold
+                && std::time::Instant::now() < deadline
+            {
+                if let Some(p) = self
+                    .position_profit_pct(&mint, &c.reward_mint, sell_amount, reward_ata, reward_baseline)
+                    .await
+                {
+                    if p >= self.cfg.strategy.hold_more_profit_pct {
+                        info!(
+                            "EXIT {mint}: профит {p:.1}% ≥ {:.1}% → ДЕРЖИМ дальше до следующего раунда (реворд {rewards_collected}/{})",
+                            self.cfg.strategy.hold_more_profit_pct,
+                            self.cfg.strategy.max_rewards_per_hold
+                        );
+                        continue 'hold;
+                    }
+                    info!("EXIT {mint}: профит {p:.1}% < порога → продаём сейчас");
+                }
+            }
+            break 'hold;
         }
 
         // Реворд пришёл → gated sell (гейт пройдёт, он уже у нас). Бюджет истёк без
@@ -771,6 +807,39 @@ impl Bot {
     }
 
     // ───────── helpers ─────────
+
+    /// Текущий профит позиции в % к затратам: (монета по кривой + полученный
+    /// реворд по котировке) / стоимость входа − 1. None, если данных не хватает.
+    async fn position_profit_pct(
+        &self,
+        mint: &Pubkey,
+        reward_mint: &Pubkey,
+        sell_amount: u64,
+        reward_ata: &Pubkey,
+        reward_baseline: u64,
+    ) -> Option<f64> {
+        let cost = self.cfg.strategy.buy_sol;
+        if cost <= 0.0 {
+            return None;
+        }
+        // Сколько SOL дадут за наши токены прямо сейчас (спот по кривой).
+        let acc = self.rpc.account(&pumpfun::bonding_curve(mint)).await.ok()??;
+        let curve = pumpfun::parse_curve(&acc.data).ok()?;
+        let coin_sol = curve.sol_out_for_tokens(sell_amount) as f64 / LAMPORTS_PER_SOL;
+        // Сколько стоит начисленный реворд (по котировке Jupiter).
+        let reward_now = self.rpc.token_amount(reward_ata).await.unwrap_or(reward_baseline);
+        let reward_raw = reward_now.saturating_sub(reward_baseline);
+        let reward_sol = if reward_raw > 0 {
+            self.jup
+                .quote(reward_mint, &WSOL_MINT, reward_raw, self.jup.cfg().slippage_bps)
+                .await
+                .map(|q| Jupiter::out_amount(&q) as f64 / LAMPORTS_PER_SOL)
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        Some(((coin_sol + reward_sol) / cost - 1.0) * 100.0)
+    }
 
     /// Снять маркер «в позиции» на старте: если бот упал посреди сделки, старый
     /// маркер остался бы висеть и вечно блокировал бы деплой. На старте мы флэт.

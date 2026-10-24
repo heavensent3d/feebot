@@ -162,8 +162,21 @@ pub struct StrategyConfig {
     /// чтобы не зависнуть на мешке навсегда, но и не дампить в ноль.
     #[serde(default = "default_bail_floor_bps")]
     pub bail_floor_bps: u64,
+    /// Получили реворд и позиция в профите ≥ этого % → НЕ продаём, держим дальше
+    /// до следующего раунда (риск отбит, апсайд — ещё реворды и рост монеты).
+    #[serde(default = "default_hold_more_profit_pct")]
+    pub hold_more_profit_pct: f64,
+    /// Максимум ревордов за один холд (чтобы не держать бесконечно).
+    #[serde(default = "default_max_rewards_per_hold")]
+    pub max_rewards_per_hold: u32,
 }
 
+fn default_hold_more_profit_pct() -> f64 {
+    20.0
+}
+fn default_max_rewards_per_hold() -> u32 {
+    3
+}
 fn default_sell_floor_bps() -> u64 {
     10_300
 }
