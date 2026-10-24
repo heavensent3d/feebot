@@ -45,11 +45,11 @@ impl Oracle {
             let Ok(mint) = Pubkey::from_str(&c.mint) else {
                 continue;
             };
-            // ETF/корзины пропускаем: сток ротируется, гейт выхода на один сток
-            // будет неверным (застрявший мешок). Поддержим позже.
-            if c.reward_basket.as_ref().map(|b| b.len() > 1).unwrap_or(false) {
-                continue;
-            }
+            // Баскет-монеты (ETF) ТОЖЕ торгуем: у них `rewardMint` = ТЕКУЩИЙ сток
+            // (по индексу `rewardCycle`), и ближайший раунд платит именно им —
+            // гейт выхода на него корректен. Ротация между раундами риск только
+            // для долгого холда; бьём коротко (как бот кента). reward_mint есть и
+            // у single, и у basket; basket[0] — страховка.
             let reward_str = c
                 .reward_mint
                 .clone()
