@@ -271,13 +271,16 @@ pub struct CoinFees {
 pub async fn fetch_coin_fees(rpc: &Rpc, mint: &Pubkey) -> Result<CoinFees> {
     let pump = PUMP_PROGRAM.to_string();
     let sigs = rpc
-        .raw("getSignaturesForAddress", serde_json::json!([mint.to_string(), {"limit": 40}]))
+        .raw("getSignaturesForAddress", serde_json::json!([mint.to_string(), {"limit": 30}]))
         .await?;
     for s in sigs.as_array().cloned().unwrap_or_default() {
         if !s.get("err").map(|e| e.is_null()).unwrap_or(false) {
             continue;
         }
         let Some(sig) = s.get("signature").and_then(|x| x.as_str()) else { continue };
+        // Троттлим: на free-RPC буст getTransaction ловит 429. Пауза держит нас под
+        // лимитом; скрейп нужен ОДИН раз на монету (дальше кэш в strategy).
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let tx = match rpc
             .raw(
                 "getTransaction",
