@@ -185,12 +185,34 @@ pub struct StrategyConfig {
     /// Выход — это гонка: конкуренты льют 300-500 падающих гейтованных продаж в
     /// секунду, чтобы исполниться в первом слоте после раздачи. Опоздал на пару
     /// секунд → −20% вместо −1.4%. Сколько транз/сек льём мы.
-    /// Падение стоит только base fee (5000 лампортов), tip НЕ списывается.
+    ///
+    /// ⚠️ ЦЕНА ПАДЕНИЯ. tip внутри упавшей tx действительно НЕ списывается (стейт
+    /// откатывается), но base fee И priority fee — списываются. priority считается
+    /// по ЗАПРОШЕННОМУ лимиту: sell_cu_price × sell_cu_limit. При 136000 × 120000
+    /// это 16320 лампортов, то есть попытка стоит 5000+16320 = 21320, а не 5000.
+    /// Пролив на весь холд (480с × 50/с = 24000 попыток) сжёг бы 0.51 SOL —
+    /// больше самой сделки. Поэтому пролив идёт ОКНОМ ПО ТРИГГЕРУ и ограничен
+    /// жёстким бюджетом `exit_spam_max_sol`.
     #[serde(default = "default_exit_spam_tps")]
     pub exit_spam_tps: u32,
     /// Как часто (сек) переподписывать пролив свежим blockhash (он живёт ~60-90с).
     #[serde(default = "default_exit_resign_secs")]
     pub exit_resign_secs: u64,
+    /// Жёсткий потолок трат на пролив за одну позицию. Исчерпали → НЕ бейлим, а
+    /// падаем в дешёвый опрос (шанс поймать реворд остаётся, деньги не горят).
+    #[serde(default = "default_exit_spam_max_sol")]
+    pub exit_spam_max_sol: f64,
+    /// Сколько секунд лить после триггера. У разобранного бота от клейма воркера
+    /// до раздачи ~37с, конкуренты начинали лить за ~13с до неё.
+    #[serde(default = "default_exit_spam_window_secs")]
+    pub exit_spam_window_secs: u64,
+    /// Как часто (мс) опрашивать котёл монеты в ожидании триггера (бесплатный HTTP).
+    #[serde(default = "default_exit_trigger_poll_ms")]
+    pub exit_trigger_poll_ms: u64,
+    /// Насколько должен подскочить `waitingSol`, чтобы считать это клеймом воркера
+    /// (прекурсор раздачи). 0 → лить сразу, как котёл выше floorSol.
+    #[serde(default = "default_exit_trigger_jump_sol")]
+    pub exit_trigger_jump_sol: f64,
 }
 
 fn default_exit_spam_tps() -> u32 {
@@ -198,6 +220,18 @@ fn default_exit_spam_tps() -> u32 {
 }
 fn default_exit_resign_secs() -> u64 {
     40
+}
+fn default_exit_spam_max_sol() -> f64 {
+    0.03
+}
+fn default_exit_spam_window_secs() -> u64 {
+    60
+}
+fn default_exit_trigger_poll_ms() -> u64 {
+    1200
+}
+fn default_exit_trigger_jump_sol() -> f64 {
+    0.005
 }
 
 fn default_breakeven_exit_pct() -> f64 {

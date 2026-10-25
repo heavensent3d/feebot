@@ -103,6 +103,18 @@ pub struct OtcRewards {
     pub last_distributed_at: u64,
 }
 
+/// Состояние «котла» монеты: /api/vault?mint=X. Раунд запускается, когда
+/// накопленный пот (`waitingSol`) перевалит порог (`floorSol`). Воркер OTC
+/// клеймит фисы pump В ПОТ за ~40с до раздачи — значит РЕЗКИЙ РОСТ `waitingSol`
+/// это прекурсор раздачи, и ловится он бесплатным HTTP (без RPC и комиссий).
+#[derive(Debug, Clone, Deserialize)]
+pub struct OtcVault {
+    #[serde(default, alias = "waitingSol", alias = "waiting_sol")]
+    pub waiting_sol: f64,
+    #[serde(default, alias = "floorSol", alias = "floor_sol")]
+    pub floor_sol: f64,
+}
+
 impl OtcClient {
     pub fn new(cfg: &OtcConfig) -> Self {
         Self {
@@ -175,6 +187,15 @@ impl OtcClient {
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("монета {mint} не найдена в /api/coins?mint="))
+    }
+
+    /// Котёл монеты — прекурсор раздачи. Дёшево (обычный HTTP), поэтому можно
+    /// опрашивать раз в секунду, не трогая RPC-лимиты.
+    pub async fn vault(&self, mint: &str) -> Result<OtcVault> {
+        let url = format!("{}/api/vault?mint={mint}", self.base);
+        let resp = self.http.get(&url).send().await.context("otc vault send")?;
+        let text = resp.text().await.context("otc vault body")?;
+        serde_json::from_str::<OtcVault>(&text).context("otc vault parse")
     }
 
     /// Список стоков, которые pump принимает как quote (из docs: /api/pairs).

@@ -653,37 +653,50 @@ impl Bot {
         // реворда нет, гейт роняет её за base fee (tip при этом НЕ списывается).
         if self.cfg.strategy.exit_spam_tps > 0 {
             if let Some(ix) = sell_ix.clone() {
-                let (sold, tries) = self
+                let (sold, tries, exhausted) = self
                     .spam_gated_exit(&mint, &user_ata, reward_ata, threshold, bal, ix)
                     .await;
                 if sold {
                     info!("EXIT {mint}: ПРОДАНО В ГОНКЕ (попыток {tries})");
                     return Ok((true, tries, sell_amount));
                 }
-                warn!("EXIT {mint}: гонка не дала результата за {}с (попыток {tries}) → бейл", self.cfg.strategy.hold_max_secs);
-                // Раздачи не случилось — аварийно выходим по слиппедж-полу.
-                let floor = cost_lamports.saturating_mul(self.cfg.strategy.bail_floor_bps) / 10_000;
-                let bail = pumpfun::build_sell_derived(&me, &mint, &creator, &coin_tp, fees, sell_amount, floor);
-                for _ in 0..10 {
-                    let mut ixs: Vec<Instruction> = compute_budget(
-                        self.cfg.strategy.sell_cu_limit,
-                        self.cfg.strategy.sell_cu_price,
-                    )
-                    .to_vec();
-                    ixs.push(bail.clone());
-                    if let Ok(bh) = self.rpc.latest_blockhash().await {
-                        let _ = self.relays.broadcast_build(&self.payer, &ixs, bh, &no_alts(), &[]).await;
-                    }
-                    if let Ok(now) = self.rpc.token_amount(&user_ata).await {
-                        if now == 0 || now < bal / 2 {
-                            info!("EXIT {mint}: закрыто бейлом (остаток {now})");
-                            return Ok((true, tries, sell_amount));
+                // Бюджет/окно пролива кончились, но холд ещё идёт — НЕ бейлим в
+                // минус: проваливаемся в дешёвый опрос ниже и ждём реворд даром.
+                if !exhausted {
+                    warn!(
+                        "EXIT {mint}: гонка не дала результата за {}с (попыток {tries}) → бейл",
+                        self.cfg.strategy.hold_max_secs
+                    );
+                    // Раздачи не случилось за весь холд — выходим по слиппедж-полу.
+                    let floor =
+                        cost_lamports.saturating_mul(self.cfg.strategy.bail_floor_bps) / 10_000;
+                    let bail = pumpfun::build_sell_derived(
+                        &me, &mint, &creator, &coin_tp, fees, sell_amount, floor,
+                    );
+                    for _ in 0..10 {
+                        let mut ixs: Vec<Instruction> = compute_budget(
+                            self.cfg.strategy.sell_cu_limit,
+                            self.cfg.strategy.sell_cu_price,
+                        )
+                        .to_vec();
+                        ixs.push(bail.clone());
+                        if let Ok(bh) = self.rpc.latest_blockhash().await {
+                            let _ = self
+                                .relays
+                                .broadcast_build(&self.payer, &ixs, bh, &no_alts(), &[])
+                                .await;
                         }
+                        if let Ok(now) = self.rpc.token_amount(&user_ata).await {
+                            if now == 0 || now < bal / 2 {
+                                info!("EXIT {mint}: закрыто бейлом (остаток {now})");
+                                return Ok((true, tries, sell_amount));
+                            }
+                        }
+                        tokio::time::sleep(poll).await;
                     }
-                    tokio::time::sleep(poll).await;
+                    warn!("EXIT {mint}: бейл не прошёл — позиция висит, разбирайся вручную");
+                    return Ok((false, tries, sell_amount));
                 }
-                warn!("EXIT {mint}: бейл не прошёл — позиция висит, разбирайся вручную");
-                return Ok((false, tries, sell_amount));
             }
         }
 
@@ -892,11 +905,77 @@ impl Bot {
 
     // ───────── helpers ─────────
 
+    /// Ждём ПРЕКУРСОР раздачи, чтобы не лить пролив вслепую весь холд.
+    ///
+    /// Воркер OTC сначала клеймит фисы pump В КОТЁЛ монеты, и только потом (у
+    /// разобранной раздачи — через ~37с) свопает котёл в сток и раздаёт. Клейм
+    /// виден как РЕЗКИЙ РОСТ `waitingSol` в /api/vault, а это обычный HTTP: можно
+    /// опрашивать раз в секунду, не тратя ни RPC-лимитов, ни комиссий.
+    ///
+    /// Возвращает true, если дождались триггера (пора лить), false — если вышло
+    /// время холда. Если котла не видно (API молчит), не блокируем выход: лучше
+    /// лить по бюджету, чем не продать совсем.
+    async fn wait_for_round_trigger(&self, mint: &Pubkey, deadline: std::time::Instant) -> bool {
+        let jump = self.cfg.strategy.exit_trigger_jump_sol;
+        if jump <= 0.0 {
+            return true; // триггер отключён — льём сразу
+        }
+        let mint_s = mint.to_string();
+        let poll = poll_ms(self.cfg.strategy.exit_trigger_poll_ms);
+        let mut base: Option<f64> = None;
+        let mut blind = 0u32;
+        info!("EXIT {mint}: ждём прекурсор раздачи (скачок котла ≥{jump} SOL), пролив пока не льём");
+        while std::time::Instant::now() < deadline {
+            match self.otc.vault(&mint_s).await {
+                Ok(v) => {
+                    blind = 0;
+                    // Котёл ниже порога — раздаче физически не из чего случиться.
+                    if v.waiting_sol < v.floor_sol {
+                        base = Some(v.waiting_sol);
+                    } else {
+                        match base {
+                            None => base = Some(v.waiting_sol),
+                            Some(prev) => {
+                                if v.waiting_sol - prev >= jump {
+                                    info!(
+                                        "EXIT {mint}: ТРИГГЕР — котёл {prev:.4}→{:.4} SOL (порог {:.4}), раздача на подходе",
+                                        v.waiting_sol, v.floor_sol
+                                    );
+                                    return true;
+                                }
+                                // Котёл упал = раздача уже прошла без нас: новый отсчёт.
+                                if v.waiting_sol < prev {
+                                    base = Some(v.waiting_sol);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    blind += 1;
+                    if blind == 5 {
+                        warn!("EXIT {mint}: котёл не читается ({e}) → льём по бюджету вслепую");
+                        return true;
+                    }
+                }
+            }
+            tokio::time::sleep(poll).await;
+        }
+        false
+    }
+
     /// ГОНКА ВЫХОДА: держим заранее подписанную гейтованную продажу и льём её с
     /// частотой `exit_spam_tps`, пока раздача не начислит реворд — тогда гейт
     /// пропускает и мы исполняемся в первом же слоте, раньше конкурентов.
-    /// Пока реворда нет, каждая попытка падает на гейте и стоит только base fee
-    /// (tip внутри упавшей tx НЕ списывается). Возвращает (продано, попыток).
+    ///
+    /// Пока реворда нет, попытка падает на гейте. Это НЕ бесплатно: tip
+    /// откатывается вместе со стейтом, но base fee (5000) и priority fee
+    /// (sell_cu_price × sell_cu_limit) списываются — при текущем конфиге 21320
+    /// лампортов за попытку. Поэтому пролив идёт только ОКНОМ после триггера и
+    /// жёстко ограничен бюджетом `exit_spam_max_sol`.
+    ///
+    /// Возвращает (продано, попыток, бюджет_исчерпан). Исчерпан → звонящий должен
+    /// не бейлить, а перейти в дешёвый опрос.
     async fn spam_gated_exit(
         &self,
         mint: &Pubkey,
@@ -905,21 +984,51 @@ impl Bot {
         threshold: u64,
         bal: u64,
         sell_ix: Instruction,
-    ) -> (bool, u64) {
+    ) -> (bool, u64, bool) {
+        let hold_deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(self.cfg.strategy.hold_max_secs);
+        if !self.wait_for_round_trigger(mint, hold_deadline).await {
+            return (false, 0, false);
+        }
+
         let tps = self.cfg.strategy.exit_spam_tps.max(1);
         let gap = std::time::Duration::from_micros(1_000_000 / tps as u64);
-        let deadline = std::time::Instant::now()
-            + std::time::Duration::from_secs(self.cfg.strategy.hold_max_secs);
+        // Окно пролива не может пережить бюджет холда.
+        let deadline = (std::time::Instant::now()
+            + std::time::Duration::from_secs(self.cfg.strategy.exit_spam_window_secs.max(1)))
+        .min(hold_deadline);
+        // Цена одной упавшей попытки: base fee + priority по ЗАПРОШЕННОМУ лимиту.
+        let per_try = 5_000
+            + (self.cfg.strategy.sell_cu_price as u128 * self.cfg.strategy.sell_cu_limit as u128
+                / 1_000_000) as u64;
+        let budget = (self.cfg.strategy.exit_spam_max_sol * LAMPORTS_PER_SOL) as u64;
+        let max_tries = (budget / per_try.max(1)).max(1);
         let resign = std::time::Duration::from_secs(self.cfg.strategy.exit_resign_secs.max(5));
         let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut fired = 0u64;
         let mut cached: Option<Vec<crate::relay::CachedTx>> = None;
         let mut signed_at = std::time::Instant::now();
         let mut last_check = std::time::Instant::now();
-        info!("EXIT {mint}: гонка — льём гейтованную продажу {tps} tx/с до раздачи");
+        info!(
+            "EXIT {mint}: гонка — {tps} tx/с, окно {}с, попытка {per_try} лампортов, бюджет {} SOL = {max_tries} попыток",
+            self.cfg.strategy.exit_spam_window_secs, self.cfg.strategy.exit_spam_max_sol
+        );
 
         loop {
+            if fired >= max_tries {
+                warn!(
+                    "EXIT {mint}: бюджет пролива исчерпан ({fired} попыток ≈ {:.4} SOL) → в дешёвый опрос",
+                    (fired * per_try) as f64 / LAMPORTS_PER_SOL
+                );
+                return (false, attempts.load(std::sync::atomic::Ordering::Relaxed), true);
+            }
             if std::time::Instant::now() >= deadline {
-                return (false, attempts.load(std::sync::atomic::Ordering::Relaxed));
+                let a = attempts.load(std::sync::atomic::Ordering::Relaxed);
+                warn!(
+                    "EXIT {mint}: окно пролива закрыто ({fired} попыток ≈ {:.4} SOL) → в дешёвый опрос",
+                    (fired * per_try) as f64 / LAMPORTS_PER_SOL
+                );
+                return (false, a, true);
             }
             // Переподписываем пролив: blockhash живёт ~60-90с.
             if cached.is_none() || signed_at.elapsed() >= resign {
@@ -954,6 +1063,7 @@ impl Bot {
             if let Some(c) = cached.clone() {
                 let relays = self.relays.clone();
                 let a = Arc::clone(&attempts);
+                fired += 1;
                 tokio::spawn(async move {
                     let _ = relays.send_cached(&c).await;
                     a.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -964,7 +1074,11 @@ impl Bot {
                 last_check = std::time::Instant::now();
                 if let Ok(now) = self.rpc.token_amount(user_ata).await {
                     if now == 0 || now < bal / 2 {
-                        return (true, attempts.load(std::sync::atomic::Ordering::Relaxed));
+                        return (
+                            true,
+                            attempts.load(std::sync::atomic::Ordering::Relaxed),
+                            false,
+                        );
                     }
                 }
             }
