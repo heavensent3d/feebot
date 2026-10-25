@@ -231,13 +231,16 @@ pub struct StrategyConfig {
 }
 
 fn default_exit_spam_tps() -> u32 {
-    0 // гонка выключена по умолчанию: включать только на сендере, который её держит
+    // Под Helius Sender: замерено 50 rps на эндпоинт на бесплатном плане, лимит
+    // складывается по регионам. 40 — с запасом на джиттер, потому что 429
+    // засчитывается в лимит и перелив лочит эндпоинт.
+    40
 }
 fn default_exit_resign_secs() -> u64 {
     40
 }
 fn default_exit_spam_max_sol() -> f64 {
-    0.03
+    0.08
 }
 fn default_exit_spam_window_secs() -> u64 {
     60
@@ -575,12 +578,24 @@ pub struct OtcConfig {
     /// Какой оракул рынка/раундов использовать: "api" или "onchain".
     #[serde(default = "default_oracle")]
     pub oracle: String,
-    /// Сколько страниц борды тянуть (на борде ~51k монет; сортируем по volume24h).
+    /// Сколько страниц борды тянуть (на борде ~52k монет).
     #[serde(default = "default_pages")]
     pub pages: usize,
     /// Размер страницы борды (API отдаёт до ~60).
     #[serde(default = "default_page_size")]
     pub page_size: usize,
+    /// Сортировка борды. РЕАЛЬНО API принимает только `volume24h`, `marketCap` и
+    /// `change24h`; любое другое значение он игнорирует и отдаёт свой ДЕФОЛТНЫЙ
+    /// порядок — а это именно свежие монеты, и он нам и нужен.
+    ///
+    /// Замер 25.10.2026 на 300 монетах дефолтного порядка: 295 с mcap ≤ $4000,
+    /// медиана $2889, холдеров 1–8. Это ровно критерии разобранного бота (mcap
+    /// ≤$4K, крошечное число получателей), и именно такие монеты раздают по
+    /// 0.15–1.4 SOL на 2–4 холдера. Для сравнения, `volume24h desc` даёт топ с
+    /// mcap $60k+ и миллионами выплаченных холдеров — там наша доля ничтожна, а
+    /// половина монет вообще ушла на AMM и не торгуется программой pump.
+    #[serde(default = "default_otc_sort")]
+    pub sort: String,
 }
 
 fn default_pages() -> usize {
@@ -588,6 +603,9 @@ fn default_pages() -> usize {
 }
 fn default_page_size() -> usize {
     50
+}
+fn default_otc_sort() -> String {
+    "fresh".to_string() // не входит в принимаемые API → дефолтный порядок (свежие)
 }
 
 impl Default for OtcConfig {
@@ -597,6 +615,7 @@ impl Default for OtcConfig {
             oracle: default_oracle(),
             pages: default_pages(),
             page_size: default_page_size(),
+            sort: default_otc_sort(),
         }
     }
 }

@@ -21,6 +21,38 @@ keypair_path = "C:/Users/you/.config/solana/feebot.json"
 # tip — отдельной инструкцией на astra…-аккаунт (relay добавит сам), мин ~10000,
 # в бою обычно 100k–300k. mev-protect можно включить и в URL (&mev-protect=true),
 # и флагом mev_protect=true ниже.
+# ── Helius Sender: ОСНОВНОЙ сендер под гонку выхода ──
+# Замерено с нашего VDS 25.10.2026: ровно 50 rps НА БЕСПЛАТНОМ плане (послали 60
+# → 50 прошло + 10×429; 120 → 50 + 70×429), латенси fra 3.4мс / ams 14.6 / lon 25.7.
+# Лимит СКЛАДЫВАЕТСЯ по регионам: залили 60 на fra и 60 на ams одновременно —
+# каждый отдал свои 50. Кредиты не тратит. Три региона = 150 tx/с бесплатно.
+#
+# ⚠️ Регионалки работают по PLAIN HTTP, не HTTPS (на https запрос висит до таймаута).
+# ⚠️ 429 ЗАСЧИТЫВАЕТСЯ в лимит, и перелив лочит эндпоинт — поэтому exit_spam_tps
+#    держим НИЖЕ 50 на эндпоинт, с запасом на джиттер.
+# Tip обязателен (Sender Max мин 0.001 SOL), но в упавшей гейтованной tx он
+# откатывается вместе со стейтом — платим его только за выигравшую продажу.
+[[relays]]
+name = "helius-fra"
+url = "http://fra-sender.helius-rpc.com/fast?api-key=YOUR_HELIUS_KEY"
+kind = "constant-k"
+tip_lamports = 1000000
+tip_account = "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE"
+
+[[relays]]
+name = "helius-ams"
+url = "http://ams-sender.helius-rpc.com/fast?api-key=YOUR_HELIUS_KEY"
+kind = "constant-k"
+tip_lamports = 1000000
+tip_account = "D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ"
+
+[[relays]]
+name = "helius-lon"
+url = "http://lon-sender.helius-rpc.com/fast?api-key=YOUR_HELIUS_KEY"
+kind = "constant-k"
+tip_lamports = 1000000
+tip_account = "9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta"
+
 [[relays]]
 name = "astralane-fr"
 url = "https://fr.gateway.astralane.io/iris?api-key=YOUR_ASTRALANE_KEY"
@@ -69,7 +101,12 @@ sell_fraction = 1.0
 buy_cu_price = 5000000        # micro-lamports/CU на вход (как у разобранного бота)
 buy_cu_limit = 120000
 sell_cu_price = 136000        # на спам-выход
-sell_cu_limit = 120000
+# ⚠️ sell_cu_limit прямо задаёт цену КАЖДОЙ упавшей попытки пролива: priority fee
+# считается по ЗАПРОШЕННОМУ лимиту, и при 120000 это 16320 из 21320 лампортов
+# попытки, то есть 77% расхода. Лидер же упорядочивает по ЦЕНЕ ЗА CU, а не по
+# сумме — значит лимит можно урезать до реальной нужды, не теряя приоритета.
+# Держать с запасом над фактическим расходом приземлившейся продажи.
+sell_cu_limit = 90000
 slippage_bps = 1500
 exit_spam_slots = 40          # сколько слотов спамить выход
 poll_ms = 400
@@ -116,9 +153,10 @@ profit_check_every_polls = 20 # как часто считать профит в
 #   неприземлившихся («landed 10% → приоритет 10%») + запрет клиентских ресендов.
 #   Нужен staked sendTransaction без tip (Constant-K Operator 15/с, Nexus 200/с)
 #   либо свой TPU-коннект.
-exit_spam_tps = 0             # 0 = гонка ВЫКЛЮЧЕНА (выход дешёвым опросом)
+exit_spam_tps = 40            # ВЫСТРЕЛОВ/с; веерится на все релеи → 40×3 = 120 tx/с
+                              # (под лимитом Helius 50 на эндпоинт, с запасом на джиттер)
 exit_resign_secs = 40         # переподписывать пролив свежим blockhash (живёт ~60-90с)
-exit_spam_max_sol = 0.03      # жёсткий потолок трат на пролив за позицию
+exit_spam_max_sol = 0.08      # потолок трат на пролив за позицию (≈30с окна на 120 tx/с)
 exit_spam_window_secs = 60    # сколько лить после триггера (у воркера клейм→раздача ~37с)
 exit_trigger_poll_ms = 1200   # опрос котла /api/vault (бесплатный HTTP, не RPC)
 exit_trigger_jump_sol = 0.005 # скачок waitingSol = клейм воркера = раздача на подходе

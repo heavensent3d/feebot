@@ -41,9 +41,11 @@ pub struct Candidate {
 
 pub struct Oracle {
     otc: OtcClient,
-    /// Сколько страниц борды тянуть (борда ~51k монет, сортируем по объёму).
+    /// Сколько страниц борды тянуть (борда ~52k монет).
     pages: usize,
     page_size: usize,
+    /// Чем сортировать борду; см. OtcConfig::sort — дефолт даёт свежие монеты.
+    sort: String,
 }
 
 impl Oracle {
@@ -52,6 +54,7 @@ impl Oracle {
             otc: OtcClient::new(cfg),
             pages: cfg.pages,
             page_size: cfg.page_size,
+            sort: cfg.sort.clone(),
         }
     }
 
@@ -85,7 +88,10 @@ impl Oracle {
 
     /// Снять борду (страницы по объёму — там, где реально копятся фисы) и собрать кандидатов.
     pub async fn candidates(&self) -> Result<Vec<Candidate>> {
-        let coins = self.otc.coins_by_volume(self.pages, self.page_size).await?;
+        let coins = self
+            .otc
+            .coins_sorted(self.pages, self.page_size, &self.sort)
+            .await?;
         let mut out = Vec::new();
         for c in coins {
             let Ok(mint) = Pubkey::from_str(&c.mint) else {

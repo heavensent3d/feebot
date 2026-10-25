@@ -156,11 +156,13 @@ impl OtcClient {
         Ok(w.coins)
     }
 
-    /// Несколько страниц, отсортированных по объёму (там, где копятся фисы).
-    pub async fn coins_by_volume(&self, pages: usize, size: usize) -> Result<Vec<OtcCoin>> {
+    /// Несколько страниц борды с заданной сортировкой. См. `OtcConfig::sort`:
+    /// неизвестное API значение даёт её дефолтный порядок — свежие монеты с
+    /// крошечным капом и 1–8 холдерами, то есть именно наш пруд.
+    pub async fn coins_sorted(&self, pages: usize, size: usize, sort: &str) -> Result<Vec<OtcCoin>> {
         let mut out = Vec::new();
         for p in 0..pages.max(1) {
-            match self.coins_page(p, size, "volume24h").await {
+            match self.coins_page(p, size, sort).await {
                 Ok(mut v) => {
                     if v.is_empty() {
                         break;

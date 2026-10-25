@@ -429,14 +429,21 @@ impl Bot {
         let fees = match cached {
             Some(f) => f,
             None => {
-                // Монета УШЛА С КРИВОЙ → инструкций buy/sell программы pump у неё
-                // больше нет, и скрейп coin_fee гарантированно вернёт пусто. Это
-                // 31 RPC-вызов в мусор, а на free-RPC ещё и 429 на остальные пути.
-                // Проверяем бесплатным HTTP (/api/vault) ПЕРЕД тем, как трогать RPC.
+                // Монета, УШЕДШАЯ НА AMM, торгуется не программой pump, поэтому
+                // скрейп coin_fee вернёт пусто — 31 RPC-вызов в мусор (а на
+                // free-RPC ещё и 429 на остальные пути). Отсекаем бесплатным HTTP
+                // ПЕРЕД тем, как трогать RPC.
+                //
+                // ⚠️ Смотреть ТОЛЬКО на `graduated`. `curveExists` к этому НЕ
+                // относится: это наличие curve-ноги в котле, и у живых платящих
+                // монет оно сплошь false. Проверено на STOCKS — distributed
+                // 0.177 SOL на 2 холдера при `graduated:false, curveExists:false`,
+                // то есть условие с curve_exists отбрасывало ровно тех, на кого мы
+                // и охотимся.
                 match self.oracle.vault(&mint.to_string()).await {
-                    Ok(v) if v.graduated || !v.curve_exists => {
-                        info!("{mint}: ушла с кривой (graduated={}, curve={}) — скип без RPC-скрейпа (кулдаун {}s)",
-                              v.graduated, v.curve_exists, Self::NO_TEMPLATE_COOLDOWN_SECS);
+                    Ok(v) if v.graduated => {
+                        info!("{mint}: ушла на AMM (graduated) — скип без RPC-скрейпа (кулдаун {}s)",
+                              Self::NO_TEMPLATE_COOLDOWN_SECS);
                         self.no_template
                             .lock()
                             .await
