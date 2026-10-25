@@ -654,7 +654,7 @@ impl Bot {
         if self.cfg.strategy.exit_spam_tps > 0 {
             if let Some(ix) = sell_ix.clone() {
                 let (sold, tries, exhausted) = self
-                    .spam_gated_exit(&mint, &user_ata, reward_ata, threshold, bal, ix)
+                    .spam_gated_exit(&mint, &user_ata, reward_ata, threshold, bal, ix, notify)
                     .await;
                 if sold {
                     info!("EXIT {mint}: ПРОДАНО В ГОНКЕ (попыток {tries})");
@@ -912,10 +912,19 @@ impl Bot {
     /// виден как РЕЗКИЙ РОСТ `waitingSol` в /api/vault, а это обычный HTTP: можно
     /// опрашивать раз в секунду, не тратя ни RPC-лимитов, ни комиссий.
     ///
+    /// Если шреды включены, тот же клейм видно мгновенно через `notify` (шред-поток
+    /// дёргает будилку по кошельку раздач OTC) — тогда ждём, что сработает раньше,
+    /// и экономим на окне пролива. Без шредов котёл несёт всю нагрузку сам.
+    ///
     /// Возвращает true, если дождались триггера (пора лить), false — если вышло
     /// время холда. Если котла не видно (API молчит), не блокируем выход: лучше
     /// лить по бюджету, чем не продать совсем.
-    async fn wait_for_round_trigger(&self, mint: &Pubkey, deadline: std::time::Instant) -> bool {
+    async fn wait_for_round_trigger(
+        &self,
+        mint: &Pubkey,
+        deadline: std::time::Instant,
+        notify: &Notify,
+    ) -> bool {
         let jump = self.cfg.strategy.exit_trigger_jump_sol;
         if jump <= 0.0 {
             return true; // триггер отключён — льём сразу
@@ -959,7 +968,14 @@ impl Bot {
                     }
                 }
             }
-            tokio::time::sleep(poll).await;
+            // Шред-будилка опережает опрос: что сработает первым, то и триггер.
+            tokio::select! {
+                _ = notify.notified() => {
+                    info!("EXIT {mint}: ТРИГГЕР от шредов (событие по кошельку раздач OTC)");
+                    return true;
+                }
+                _ = tokio::time::sleep(poll) => {}
+            }
         }
         false
     }
@@ -984,10 +1000,11 @@ impl Bot {
         threshold: u64,
         bal: u64,
         sell_ix: Instruction,
+        notify: &Notify,
     ) -> (bool, u64, bool) {
         let hold_deadline = std::time::Instant::now()
             + std::time::Duration::from_secs(self.cfg.strategy.hold_max_secs);
-        if !self.wait_for_round_trigger(mint, hold_deadline).await {
+        if !self.wait_for_round_trigger(mint, hold_deadline, notify).await {
             return (false, 0, false);
         }
 
@@ -997,10 +1014,16 @@ impl Bot {
         let deadline = (std::time::Instant::now()
             + std::time::Duration::from_secs(self.cfg.strategy.exit_spam_window_secs.max(1)))
         .min(hold_deadline);
-        // Цена одной упавшей попытки: base fee + priority по ЗАПРОШЕННОМУ лимиту.
-        let per_try = 5_000
+        // Цена ОДНОГО ВЫСТРЕЛА. Важно: send_cached веерит на ВСЕ эндпоинты сразу,
+        // то есть один выстрел = по одной упавшей tx на каждый релей, и платим
+        // комиссию за каждую. Поэтому цена попытки умножается на число релеев,
+        // иначе потолок бюджета завышен ровно в это число раз.
+        // Комиссия одной tx: base fee + priority по ЗАПРОШЕННОМУ лимиту CU.
+        let relays = self.relays.endpoint_count().max(1) as u64;
+        let per_tx = 5_000
             + (self.cfg.strategy.sell_cu_price as u128 * self.cfg.strategy.sell_cu_limit as u128
                 / 1_000_000) as u64;
+        let per_try = per_tx.saturating_mul(relays);
         let budget = (self.cfg.strategy.exit_spam_max_sol * LAMPORTS_PER_SOL) as u64;
         let max_tries = (budget / per_try.max(1)).max(1);
         let resign = std::time::Duration::from_secs(self.cfg.strategy.exit_resign_secs.max(5));
@@ -1010,8 +1033,11 @@ impl Bot {
         let mut signed_at = std::time::Instant::now();
         let mut last_check = std::time::Instant::now();
         info!(
-            "EXIT {mint}: гонка — {tps} tx/с, окно {}с, попытка {per_try} лампортов, бюджет {} SOL = {max_tries} попыток",
-            self.cfg.strategy.exit_spam_window_secs, self.cfg.strategy.exit_spam_max_sol
+            "EXIT {mint}: гонка — {tps} выстрелов/с × {relays} релеев = {} tx/с, окно {}с, \
+             выстрел {per_try} лампортов ({per_tx}×{relays}), бюджет {} SOL = {max_tries} выстрелов",
+            tps as u64 * relays,
+            self.cfg.strategy.exit_spam_window_secs,
+            self.cfg.strategy.exit_spam_max_sol
         );
 
         loop {

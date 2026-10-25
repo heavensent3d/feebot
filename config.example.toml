@@ -166,7 +166,10 @@ oracle = "api"
 enabled = false
 endpoint = "http://fra.pulse.raiden.wtf:16000"   # FRA / AMS / NYC
 filter_name = "otc"
-account_include = []       # например ["2k5hrzuykwyTbUe8L7UriYAQhr5hijNLgBvEB4B9pP5y"]
+# ОБЯЗАТЕЛЬНО кошелёк раздач OTC: через него идёт И клейм фисов воркером
+# (прекурсор раздачи, за ~37с до неё), И сама раздача. Пустой список = поток
+# ни о чём не будит, и шреды не дают ничего, за что мы платим.
+account_include = ["2k5hrzuykwyTbUe8L7UriYAQhr5hijNLgBvEB4B9pP5y"]
 account_required = []
 account_exclude = []
 
