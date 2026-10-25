@@ -926,7 +926,7 @@ impl Bot {
         let mut blind = 0u32;
         info!("EXIT {mint}: ждём прекурсор раздачи (скачок котла ≥{jump} SOL), пролив пока не льём");
         while std::time::Instant::now() < deadline {
-            match self.otc.vault(&mint_s).await {
+            match self.oracle.vault(&mint_s).await {
                 Ok(v) => {
                     blind = 0;
                     // Котёл ниже порога — раздаче физически не из чего случиться.

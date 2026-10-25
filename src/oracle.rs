@@ -55,6 +55,11 @@ impl Oracle {
         }
     }
 
+    /// Котёл монеты (waitingSol / floorSol) — прекурсор раздачи для гонки выхода.
+    pub async fn vault(&self, mint: &str) -> anyhow::Result<crate::otc::OtcVault> {
+        self.otc.vault(mint).await
+    }
+
     /// Догрузить `rewards` по монете (owed / distributed / lastPaidHolders).
     /// Отдельный per-coin запрос — дёргаем только для прошедших дешёвый прескрин.
     /// Возвращает (owed_sol, distributed_sol, last_paid_holders, last_payout_age_secs).
