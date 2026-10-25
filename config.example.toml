@@ -36,21 +36,21 @@ keypair_path = "C:/Users/you/.config/solana/feebot.json"
 name = "helius-fra"
 url = "http://fra-sender.helius-rpc.com/fast?api-key=YOUR_HELIUS_KEY"
 kind = "constant-k"
-tip_lamports = 1000000
+tip_lamports = 5000           # SWQOS-минимум: tip очередь НЕ покупает, её покупает CU price
 tip_account = "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE"
 
 [[relays]]
 name = "helius-ams"
 url = "http://ams-sender.helius-rpc.com/fast?api-key=YOUR_HELIUS_KEY"
 kind = "constant-k"
-tip_lamports = 1000000
+tip_lamports = 5000
 tip_account = "D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ"
 
 [[relays]]
 name = "helius-lon"
 url = "http://lon-sender.helius-rpc.com/fast?api-key=YOUR_HELIUS_KEY"
 kind = "constant-k"
-tip_lamports = 1000000
+tip_lamports = 5000
 tip_account = "9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta"
 
 [[relays]]
@@ -100,13 +100,17 @@ buy_sol = 1.5
 sell_fraction = 1.0
 buy_cu_price = 5000000        # micro-lamports/CU на вход (как у разобранного бота)
 buy_cu_limit = 120000
-sell_cu_price = 136000        # на спам-выход
+# Цена CU — ЭТО и есть очередь в блоке, а не tip. Замер по конкуренту в одной
+# монете: он 13 477 671 micro-lamports/CU и tip 0.000005 SOL, мы 136 000 и tip
+# 0.001 — он вошёл на 8 слотов раньше. Тип очередь не покупает.
+# Продаж теперь немного (пролив выключен), поэтому цену держим конкурентной.
+sell_cu_price = 13500000
 # ⚠️ sell_cu_limit прямо задаёт цену КАЖДОЙ упавшей попытки пролива: priority fee
 # считается по ЗАПРОШЕННОМУ лимиту, и при 120000 это 16320 из 21320 лампортов
 # попытки, то есть 77% расхода. Лидер же упорядочивает по ЦЕНЕ ЗА CU, а не по
 # сумме — значит лимит можно урезать до реальной нужды, не теряя приоритета.
 # Держать с запасом над фактическим расходом приземлившейся продажи.
-sell_cu_limit = 90000
+sell_cu_limit = 60000         # факт расхода продажи 52 013 CU; лишний лимит = прямая переплата
 slippage_bps = 1500
 exit_spam_slots = 40          # сколько слотов спамить выход
 poll_ms = 400
@@ -165,8 +169,11 @@ profit_check_every_polls = 20 # как часто считать профит в
 #   неприземлившихся («landed 10% → приоритет 10%») + запрет клиентских ресендов.
 #   Нужен staked sendTransaction без tip (Constant-K Operator 15/с, Nexus 200/с)
 #   либо свой TPU-коннект.
-exit_spam_tps = 40            # ВЫСТРЕЛОВ/с; веерится на все релеи → 40×3 = 120 tx/с
-                              # (под лимитом Helius 50 на эндпоинт, с запасом на джиттер)
+# 0 = ПРОЛИВ ВЫКЛЮЧЕН по итогам замера: 4638 отправленных транз -> приземлилось
+# НОЛЬ (наша цена CU в 99 раз ниже конкурентной, лидер не включает). Поднять цену
+# и лить одновременно нельзя — каждая упавшая попытка платит priority по
+# запрошенному лимиту. А опоздание на 8 слотов стоило лишь 4.6% цены монеты.
+exit_spam_tps = 0
 exit_resign_secs = 40         # переподписывать пролив свежим blockhash (живёт ~60-90с)
 exit_spam_max_sol = 0.08      # потолок трат на пролив за позицию (≈30с окна на 120 tx/с)
 exit_spam_window_secs = 60    # сколько лить после триггера (у воркера клейм→раздача ~37с)
