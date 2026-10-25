@@ -279,6 +279,12 @@ impl Bot {
         let max_float = self.cfg.strategy.max_qualified_float_usd;
         let cooldown = self.cfg.strategy.post_trade_cooldown_secs;
         let mut considered = 0usize;
+        // Разбор отсева по этапам. Без него бот при нулевом результате просто молчит,
+        // и «работает, но ничего не подходит» не отличить от «сломан» — именно на
+        // этом мы потеряли время на первом боевом запуске.
+        let total = cands.len();
+        let (mut sk_active, mut sk_cooldown, mut sk_rounds, mut sk_notpl) = (0, 0, 0, 0);
+        let (mut sk_pre1, mut sk_pre2, mut sk_float, mut sk_eval, mut sk_rmint) = (0, 0, 0, 0, 0);
         for mut c in cands {
             // Нет свободного слота — дальше перебирать незачем.
             if self.slots.available_permits() == 0 {
@@ -286,6 +292,7 @@ impl Bot {
             }
             // Уже держим этот мемкоин.
             if self.active.lock().await.contains(&c.mint) {
+                sk_active += 1;
                 continue;
             }
             // Кулдаун на повторный вход в только что проторгованную монету.
@@ -293,6 +300,7 @@ impl Bot {
                 let rtd = self.recent_trade.lock().await;
                 if let Some(t) = rtd.get(&c.mint) {
                     if t.elapsed().as_secs() < cooldown {
+                        sk_cooldown += 1;
                         continue;
                     }
                 }
@@ -300,6 +308,7 @@ impl Bot {
             // ГЛАВНЫЙ гейт модели: монета должна АКТИВНО раундиться (иначе раунд не
             // придёт, пока держим — именно на этом бот сливал). Дёшево, из памяти.
             if self.rounds_in_window(&c.mint).await < min_rounds {
+                sk_rounds += 1;
                 continue;
             }
             // Недавно у этой монеты не нашли buy-шаблон — пропускаем на кулдаун,
@@ -308,6 +317,7 @@ impl Bot {
                 let mut nt = self.no_template.lock().await;
                 if let Some(t) = nt.get(&c.mint) {
                     if t.elapsed().as_secs() < Self::NO_TEMPLATE_COOLDOWN_SECS {
+                        sk_notpl += 1;
                         continue;
                     }
                     nt.remove(&c.mint); // кулдаун истёк — дадим ещё шанс
@@ -315,6 +325,7 @@ impl Bot {
             }
             // Дешёвый прескрин без RPC (капа/объём/ликвидность) — до per-coin запроса.
             if matches!(self.filters.prescreen(&c), Verdict::Skip(_)) {
+                sk_pre1 += 1;
                 continue;
             }
             // Догружаем rewards (owed / distributed / lastPaidHolders) — объект приходит
@@ -330,6 +341,7 @@ impl Bot {
             }
             // Прескрин ещё раз — теперь с rewards-гейтами (роздано / холдеры / обвал).
             if let Verdict::Skip(_r) = self.filters.prescreen(&c) {
+                sk_pre2 += 1;
                 continue;
             }
             // Реальный он-чейн флоат только для прошедших прескрин (экономим RPC).
@@ -337,17 +349,22 @@ impl Bot {
             // Эдж = КРОШЕЧНЫЙ флоат (наша доля большая). Над порогом доля мелкая → скип.
             if let Some(f) = float_override {
                 if f > max_float {
+                    sk_float += 1;
                     continue;
                 }
             }
             match self.filters.evaluate(&c, buy_sol, sol_price, float_override) {
-                Verdict::Skip(_reason) => continue,
+                Verdict::Skip(_reason) => {
+                    sk_eval += 1;
+                    continue;
+                }
                 Verdict::Take => {}
             }
             // Не фармить два мемкоина на один и тот же reward-сток.
             {
                 let mut rm = self.active_reward_mints.lock().await;
                 if rm.contains(&c.reward_mint) {
+                    sk_rmint += 1;
                     continue;
                 }
                 rm.insert(c.reward_mint);
@@ -379,6 +396,15 @@ impl Bot {
                 me.active_reward_mints.lock().await.remove(&reward_mint);
                 me.active.lock().await.remove(&mint);
             });
+        }
+        if considered == 0 {
+            // Говорим ВСЛУХ, почему ни один кандидат не подошёл.
+            info!(
+                "tick: из {total} кандидатов не подошёл никто — отсев: держим {sk_active}, \
+                 кулдаун {sk_cooldown}, нет раундов {sk_rounds}, нет шаблона {sk_notpl}, \
+                 прескрин {sk_pre1}, реворды {sk_pre2}, флоат {sk_float}, EV {sk_eval}, \
+                 сток занят {sk_rmint}"
+            );
         }
         if considered > 0 {
             info!("tick: открыто попыток входа {considered}");
@@ -461,10 +487,11 @@ impl Bot {
                         "{mint}: котёл заполнен {fill:.1}% (нужно ≥{:.0}%, {:.4}/{:.4} SOL) — раунд не успеет, скип",
                         self.cfg.strategy.min_vault_fill_pct, v.waiting_sol, v.floor_sol
                     );
-                    self.recent_trade
-                        .lock()
-                        .await
-                        .insert(mint, std::time::Instant::now());
+                    // ⚠️ НЕ ставим кулдаун recent_trade: это «раунд не близко ПРЯМО
+                    // СЕЙЧАС», а не «мы только что торговали». Котёл наполняется за
+                    // минуты, и монета может подойти уже через тик. Кулдаун здесь
+                    // отравлял бы весь пул кандидатов: за пару минут все они ушли бы
+                    // в 120-секундный бан, и бот замолчал бы без причины.
                     return Ok(());
                 }
                 info!("{mint}: котёл заполнен {fill:.1}% ({:.4}/{:.4} SOL) — раунд близко, входим",
