@@ -113,6 +113,13 @@ pub struct OtcVault {
     pub waiting_sol: f64,
     #[serde(default, alias = "floorSol", alias = "floor_sol")]
     pub floor_sol: f64,
+    /// Жива ли ещё бондинг-кривая pump у монеты.
+    #[serde(default, alias = "curveExists", alias = "curve_exists")]
+    pub curve_exists: bool,
+    /// Монета ушла с кривой на AMM — инструкций buy/sell программы pump у неё
+    /// больше нет, скрейпить coin_fee бессмысленно.
+    #[serde(default)]
+    pub graduated: bool,
 }
 
 impl OtcClient {

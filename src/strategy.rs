@@ -428,20 +428,39 @@ impl Bot {
         let cached = self.coin_fees.lock().await.get(&mint).copied();
         let fees = match cached {
             Some(f) => f,
-            None => match pumpfun::fetch_coin_fees(&self.rpc, &mint).await {
-                Ok(f) => {
-                    self.coin_fees.lock().await.insert(mint, f);
-                    f
+            None => {
+                // Монета УШЛА С КРИВОЙ → инструкций buy/sell программы pump у неё
+                // больше нет, и скрейп coin_fee гарантированно вернёт пусто. Это
+                // 31 RPC-вызов в мусор, а на free-RPC ещё и 429 на остальные пути.
+                // Проверяем бесплатным HTTP (/api/vault) ПЕРЕД тем, как трогать RPC.
+                match self.oracle.vault(&mint.to_string()).await {
+                    Ok(v) if v.graduated || !v.curve_exists => {
+                        info!("{mint}: ушла с кривой (graduated={}, curve={}) — скип без RPC-скрейпа (кулдаун {}s)",
+                              v.graduated, v.curve_exists, Self::NO_TEMPLATE_COOLDOWN_SECS);
+                        self.no_template
+                            .lock()
+                            .await
+                            .insert(mint, std::time::Instant::now());
+                        return Ok(());
+                    }
+                    // Котёл не прочитался — не блокируем вход, идём скрейпить.
+                    _ => {}
                 }
-                Err(e) => {
-                    info!("{mint}: нет coin_fee ({e}) — пропуск позиции (кулдаун {}s)", Self::NO_TEMPLATE_COOLDOWN_SECS);
-                    self.no_template
-                        .lock()
-                        .await
-                        .insert(mint, std::time::Instant::now());
-                    return Ok(());
+                match pumpfun::fetch_coin_fees(&self.rpc, &mint).await {
+                    Ok(f) => {
+                        self.coin_fees.lock().await.insert(mint, f);
+                        f
+                    }
+                    Err(e) => {
+                        info!("{mint}: нет coin_fee ({e}) — пропуск позиции (кулдаун {}s)", Self::NO_TEMPLATE_COOLDOWN_SECS);
+                        self.no_template
+                            .lock()
+                            .await
+                            .insert(mint, std::time::Instant::now());
+                        return Ok(());
+                    }
                 }
-            },
+            }
         };
         // ATA мемкоина (его token-программа) + ATA reward-стока (Token-2022).
         let coin_ata_ix = spl_associated_token_account::instruction::create_associated_token_account_idempotent(

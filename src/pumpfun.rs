@@ -15,6 +15,8 @@ use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 use std::str::FromStr;
 
+use tracing::warn;
+
 use crate::programs::*;
 use crate::rpc::Rpc;
 
@@ -129,7 +131,7 @@ pub async fn fetch_template(rpc: &Rpc, mint: &Pubkey, disc: &[u8; 8]) -> Result<
         let tx = match rpc
             .raw(
                 "getTransaction",
-                serde_json::json!([sig, {"encoding":"jsonParsed","maxSupportedTransactionVersion":0}]),
+                serde_json::json!([sig, {"encoding":"jsonParsed","maxSupportedTransactionVersion":1}]),
             )
             .await
         {
@@ -266,68 +268,99 @@ pub struct CoinFees {
     pub coin_fee_b: Pubkey,
 }
 
+/// Сколько транзакций тянем ОДНИМ пакетным запросом. Холодный батч на 30 транз у
+/// RPC занимает до ~16с, поэтому берём небольшими чанками и выходим на первом
+/// совпадении: обычно хватает первого чанка.
+const FEES_SCAN_CHUNK: usize = 6;
+
 /// Достать coin_fee_A/B из свежей реальной buy ИЛИ sell монеты. В buy они на
 /// индексах 16,17; в sell — 14,15. Сканируем последние сигнатуры (top+inner).
+///
+/// Вывести эти аккаунты деривацией нельзя — проверено брутфорсом сидов (префиксы
+/// fee/coin_fee/fee_vault/… × аккаунты инструкции × pfee|pump|ATA, все бампы):
+/// совпадений нет, нужен IDL pfee. Поэтому скрейп остаётся, но он пакетный.
+///
+/// ВАЖНО по `maxSupportedTransactionVersion`: должно быть 1, а не 0. С нулём RPC
+/// отвечает ошибкой -32015 на каждую v1-транзу, и мы теряли ~29% выборки (8 из 28
+/// на замере) — то есть не находили шаблон у вполне живых монет и зря уводили их
+/// в no_template-кулдаун.
 pub async fn fetch_coin_fees(rpc: &Rpc, mint: &Pubkey) -> Result<CoinFees> {
     let pump = PUMP_PROGRAM.to_string();
     let sigs = rpc
         .raw("getSignaturesForAddress", serde_json::json!([mint.to_string(), {"limit": 30}]))
         .await?;
-    for s in sigs.as_array().cloned().unwrap_or_default() {
-        if !s.get("err").map(|e| e.is_null()).unwrap_or(false) {
-            continue;
-        }
-        let Some(sig) = s.get("signature").and_then(|x| x.as_str()) else { continue };
-        // Троттлим: на free-RPC буст getTransaction ловит 429. Пауза держит нас под
-        // лимитом; скрейп нужен ОДИН раз на монету (дальше кэш в strategy).
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let tx = match rpc
-            .raw(
-                "getTransaction",
-                serde_json::json!([sig, {"encoding":"jsonParsed","maxSupportedTransactionVersion":0}]),
-            )
-            .await
-        {
-            Ok(t) if !t.is_null() => t,
-            _ => continue,
+    let ok_sigs: Vec<String> = sigs
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| s.get("err").map(|e| e.is_null()).unwrap_or(false))
+        .filter_map(|s| s.get("signature").and_then(|x| x.as_str()).map(String::from))
+        .collect();
+
+    for chunk in ok_sigs.chunks(FEES_SCAN_CHUNK) {
+        let calls: Vec<(&str, serde_json::Value)> = chunk
+            .iter()
+            .map(|sig| {
+                (
+                    "getTransaction",
+                    serde_json::json!([sig, {"encoding":"jsonParsed","maxSupportedTransactionVersion":1}]),
+                )
+            })
+            .collect();
+        let txs = match rpc.batch(&calls).await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("coin_fee {mint}: батч не прошёл ({e}) — пробуем следующий чанк");
+                continue;
+            }
         };
-        // top-level + inner инструкции
-        let mut all: Vec<serde_json::Value> = tx["transaction"]["message"]["instructions"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        if let Some(inner) = tx["meta"]["innerInstructions"].as_array() {
-            for grp in inner {
-                if let Some(g) = grp["instructions"].as_array() {
-                    all.extend(g.iter().cloned());
-                }
-            }
-        }
-        for ins in &all {
-            if ins["programId"].as_str() != Some(pump.as_str()) {
-                continue;
-            }
-            let data = ins["data"].as_str().unwrap_or("");
-            let bytes = bs58::decode(data).into_vec().unwrap_or_default();
-            if bytes.len() < 8 {
-                continue;
-            }
-            let Some(accs) = ins["accounts"].as_array() else { continue };
-            let (ia, ib) = if bytes[..8] == DISC_BUY_EXACT_SOL_IN && accs.len() >= 18 {
-                (16usize, 17usize)
-            } else if bytes[..8] == DISC_SELL && accs.len() >= 16 {
-                (14usize, 15usize)
-            } else {
-                continue;
-            };
-            let a = accs[ia].as_str().and_then(|s| Pubkey::from_str(s).ok());
-            let b = accs[ib].as_str().and_then(|s| Pubkey::from_str(s).ok());
-            if let (Some(coin_fee_a), Some(coin_fee_b)) = (a, b) {
-                return Ok(CoinFees { coin_fee_a, coin_fee_b });
+        for tx in txs.into_iter().flatten() {
+            if let Some(f) = fees_from_tx(&tx, &pump) {
+                return Ok(f);
             }
         }
     }
     Err(anyhow!("coin_fee для {mint} не найден (нет свежих buy/sell монеты)"))
+}
+
+/// Выбрать coin_fee_A/B из одной разобранной транзакции (top-level + inner).
+fn fees_from_tx(tx: &serde_json::Value, pump: &str) -> Option<CoinFees> {
+    let mut all: Vec<serde_json::Value> = tx["transaction"]["message"]["instructions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if let Some(inner) = tx["meta"]["innerInstructions"].as_array() {
+        for grp in inner {
+            if let Some(g) = grp["instructions"].as_array() {
+                all.extend(g.iter().cloned());
+            }
+        }
+    }
+    for ins in &all {
+        if ins["programId"].as_str() != Some(pump) {
+            continue;
+        }
+        let data = ins["data"].as_str().unwrap_or("");
+        let bytes = bs58::decode(data).into_vec().unwrap_or_default();
+        if bytes.len() < 8 {
+            continue;
+        }
+        let accs = ins["accounts"].as_array()?;
+        let (ia, ib) = if bytes[..8] == DISC_BUY_EXACT_SOL_IN && accs.len() >= 18 {
+            (16usize, 17usize)
+        } else if bytes[..8] == DISC_SELL && accs.len() >= 16 {
+            (14usize, 15usize)
+        } else {
+            continue;
+        };
+        let a = accs[ia].as_str().and_then(|s| Pubkey::from_str(s).ok());
+        let b = accs[ib].as_str().and_then(|s| Pubkey::from_str(s).ok());
+        if let (Some(coin_fee_a), Some(coin_fee_b)) = (a, b) {
+            return Some(CoinFees { coin_fee_a, coin_fee_b });
+        }
+    }
+    None
 }
 
 /// Собрать `buy_exact_sol_in` ПОЛНОСТЬЮ из деривации (18 аккаунтов) + coin_fee.

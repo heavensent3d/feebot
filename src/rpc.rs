@@ -47,6 +47,53 @@ impl Rpc {
         Ok(v.get("result").cloned().unwrap_or(serde_json::Value::Null))
     }
 
+    /// Пакетный JSON-RPC: массив запросов ОДНИМ POST. Нужен там, где иначе пришлось
+    /// бы слать десятки вызовов подряд и упираться в rate-limit (скрейп coin_fee).
+    /// Возвращает результаты В ПОРЯДКЕ запросов; элемент = None, если по нему
+    /// пришла ошибка или пусто (ответ батча приходит В ПРОИЗВОЛЬНОМ порядке, поэтому
+    /// раскладываем по `id`).
+    pub async fn batch(
+        &self,
+        calls: &[(&str, serde_json::Value)],
+    ) -> Result<Vec<Option<serde_json::Value>>> {
+        if calls.is_empty() {
+            return Ok(Vec::new());
+        }
+        let body: Vec<serde_json::Value> = calls
+            .iter()
+            .enumerate()
+            .map(|(i, (m, p))| serde_json::json!({"jsonrpc":"2.0","id":i,"method":m,"params":p}))
+            .collect();
+        let resp = self.rq.post(&self.http_url).json(&body).send().await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+        let v: serde_json::Value = serde_json::from_str(&text).map_err(|_| {
+            let snip: String = text.chars().take(120).collect();
+            anyhow!("rpc batch: не-JSON ответ (HTTP {status}): {snip}")
+        })?;
+        // Батч может вернуться и одиночной ошибкой (напр. 429) вместо массива.
+        let arr = match v.as_array() {
+            Some(a) => a,
+            None => {
+                let e = v.get("error").cloned().unwrap_or(v.clone());
+                return Err(anyhow!("rpc batch: {e}"));
+            }
+        };
+        let mut out = vec![None; calls.len()];
+        for item in arr {
+            let Some(i) = item.get("id").and_then(|x| x.as_u64()) else { continue };
+            let Some(slot) = out.get_mut(i as usize) else { continue };
+            if item.get("error").is_some() {
+                continue;
+            }
+            *slot = item
+                .get("result")
+                .cloned()
+                .filter(|r| !r.is_null());
+        }
+        Ok(out)
+    }
+
     pub async fn latest_blockhash(&self) -> Result<Hash> {
         Ok(self.client.get_latest_blockhash().await?)
     }
