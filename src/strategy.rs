@@ -422,52 +422,78 @@ impl Bot {
         let tokens_out = curve.tokens_out_for_sol(buy_lamports);
         let min_tokens = tokens_out - tokens_out * self.cfg.strategy.slippage_bps / 10_000;
 
+        // ── КОТЁЛ МОНЕТЫ: один бесплатный HTTP, два решения о входе ──
+        // Делаем ДО кэша coin_fee, потому что это решение про КАЖДЫЙ вход, а не
+        // про разовый скрейп: монета с закэшированными фисами всё равно обязана
+        // проходить проверку «раунд близко».
+        match self.oracle.vault(&mint.to_string()).await {
+            // Монета, ушедшая на AMM, торгуется не программой pump, поэтому скрейп
+            // coin_fee вернёт пусто — 31 RPC-вызов в мусор (а на free-RPC ещё и 429
+            // на остальные пути).
+            //
+            // ⚠️ Смотреть ТОЛЬКО на `graduated`. `curveExists` к этому НЕ относится:
+            // это наличие curve-ноги в котле, и у живых платящих монет оно сплошь
+            // false. Проверено на STOCKS — distributed 0.177 SOL на 2 холдера при
+            // `graduated:false, curveExists:false`, то есть условие с curve_exists
+            // отбрасывало ровно тех, на кого мы и охотимся.
+            Ok(v) if v.graduated => {
+                info!("{mint}: ушла на AMM (graduated) — скип без RPC-скрейпа (кулдаун {}s)",
+                      Self::NO_TEMPLATE_COOLDOWN_SECS);
+                self.no_template
+                    .lock()
+                    .await
+                    .insert(mint, std::time::Instant::now());
+                return Ok(());
+            }
+            Ok(v) => {
+                // КОТЁЛ ПУСТ → раунд в наш холд не придёт, и мы отсидим
+                // hold_max_secs только чтобы выйти по бейлу в минус. Монета может
+                // быть идеальной по капе/холдерам/истории выплат и всё равно быть
+                // убыточной ПРЯМО СЕЙЧАС. Фильтруем долей, а не абсолютом:
+                // floorSol у монет разный (видели 0.002 и 0.1).
+                let fill = if v.floor_sol > 0.0 {
+                    100.0 * v.waiting_sol / v.floor_sol
+                } else {
+                    0.0
+                };
+                if fill < self.cfg.strategy.min_vault_fill_pct {
+                    info!(
+                        "{mint}: котёл заполнен {fill:.1}% (нужно ≥{:.0}%, {:.4}/{:.4} SOL) — раунд не успеет, скип",
+                        self.cfg.strategy.min_vault_fill_pct, v.waiting_sol, v.floor_sol
+                    );
+                    self.recent_trade
+                        .lock()
+                        .await
+                        .insert(mint, std::time::Instant::now());
+                    return Ok(());
+                }
+                info!("{mint}: котёл заполнен {fill:.1}% ({:.4}/{:.4} SOL) — раунд близко, входим",
+                      v.waiting_sol, v.floor_sol);
+            }
+            // Котёл не прочитался — не блокируем вход, идём дальше.
+            Err(_) => {}
+        }
+
         // coin_fee_A/B из свежей реальной buy/sell монеты (остальное деривируем).
         // Кэшируем per-coin: нет свежих buy/sell → монета не торгуется, фисов не
         // будет, скип с кулдауном.
         let cached = self.coin_fees.lock().await.get(&mint).copied();
         let fees = match cached {
             Some(f) => f,
-            None => {
-                // Монета, УШЕДШАЯ НА AMM, торгуется не программой pump, поэтому
-                // скрейп coin_fee вернёт пусто — 31 RPC-вызов в мусор (а на
-                // free-RPC ещё и 429 на остальные пути). Отсекаем бесплатным HTTP
-                // ПЕРЕД тем, как трогать RPC.
-                //
-                // ⚠️ Смотреть ТОЛЬКО на `graduated`. `curveExists` к этому НЕ
-                // относится: это наличие curve-ноги в котле, и у живых платящих
-                // монет оно сплошь false. Проверено на STOCKS — distributed
-                // 0.177 SOL на 2 холдера при `graduated:false, curveExists:false`,
-                // то есть условие с curve_exists отбрасывало ровно тех, на кого мы
-                // и охотимся.
-                match self.oracle.vault(&mint.to_string()).await {
-                    Ok(v) if v.graduated => {
-                        info!("{mint}: ушла на AMM (graduated) — скип без RPC-скрейпа (кулдаун {}s)",
-                              Self::NO_TEMPLATE_COOLDOWN_SECS);
-                        self.no_template
-                            .lock()
-                            .await
-                            .insert(mint, std::time::Instant::now());
-                        return Ok(());
-                    }
-                    // Котёл не прочитался — не блокируем вход, идём скрейпить.
-                    _ => {}
+            None => match pumpfun::fetch_coin_fees(&self.rpc, &mint).await {
+                Ok(f) => {
+                    self.coin_fees.lock().await.insert(mint, f);
+                    f
                 }
-                match pumpfun::fetch_coin_fees(&self.rpc, &mint).await {
-                    Ok(f) => {
-                        self.coin_fees.lock().await.insert(mint, f);
-                        f
-                    }
-                    Err(e) => {
-                        info!("{mint}: нет coin_fee ({e}) — пропуск позиции (кулдаун {}s)", Self::NO_TEMPLATE_COOLDOWN_SECS);
-                        self.no_template
-                            .lock()
-                            .await
-                            .insert(mint, std::time::Instant::now());
-                        return Ok(());
-                    }
+                Err(e) => {
+                    info!("{mint}: нет coin_fee ({e}) — пропуск позиции (кулдаун {}s)", Self::NO_TEMPLATE_COOLDOWN_SECS);
+                    self.no_template
+                        .lock()
+                        .await
+                        .insert(mint, std::time::Instant::now());
+                    return Ok(());
                 }
-            }
+            },
         };
         // ATA мемкоина (его token-программа) + ATA reward-стока (Token-2022).
         let coin_ata_ix = spl_associated_token_account::instruction::create_associated_token_account_idempotent(
