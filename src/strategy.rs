@@ -19,6 +19,7 @@ use crate::jupiter::Jupiter;
 use crate::lighthouse::{assert_account_lamports, assert_token_amount, Op};
 use crate::nonce;
 use crate::oracle::{Candidate, Oracle};
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use crate::programs::{TOKEN_2022_PROGRAM, TOKEN_PROGRAM, WSOL_MINT};
 use crate::pumpfun;
 use crate::pumpswap;
@@ -997,13 +998,32 @@ impl Bot {
                 .swap_signed(&quote, &self.payer, self.cfg.strategy.sell_cu_price)
                 .await
             {
-                Ok(tx) => match self.relays.broadcast(&tx).await {
-                    Ok(sig) => info!(
-                        "SELL reward {} → ~{:.4} SOL: {sig}",
-                        ta.mint,
-                        out as f64 / LAMPORTS_PER_SOL
-                    ),
-                    Err(e) => warn!("reward swap send {}: {e}", ta.mint),
+                // Своп шлём ОБЫЧНЫМ RPC, а не через релеи-сендеры. Транзакцию
+                // строит Jupiter, и вставить в неё tip-инструкцию мы не можем, а
+                // Helius Sender без tip отвечает отказом («нет result») — из-за
+                // этого продажа реворда падала даже с рабочей котировкой.
+                // Скорость тут не нужна: это не гонка, а обычная конвертация.
+                Ok(tx) => match bincode::serialize(&tx)
+                    .map_err(|e| anyhow!("serialize swap: {e}"))
+                    .and_then(|raw| Ok(B64.encode(raw)))
+                {
+                    Ok(wire) => match self
+                        .rpc
+                        .raw(
+                            "sendTransaction",
+                            serde_json::json!([wire, {"encoding":"base64","skipPreflight":true,"maxRetries":3}]),
+                        )
+                        .await
+                    {
+                        Ok(v) => info!(
+                            "SELL reward {} → ~{:.4} SOL: {}",
+                            ta.mint,
+                            out as f64 / LAMPORTS_PER_SOL,
+                            v.as_str().unwrap_or("отправлено")
+                        ),
+                        Err(e) => warn!("reward swap send {}: {e}", ta.mint),
+                    },
+                    Err(e) => warn!("reward swap serialize {}: {e}", ta.mint),
                 },
                 Err(e) => warn!("reward swap build {}: {e}", ta.mint),
             }
