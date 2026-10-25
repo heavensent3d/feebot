@@ -375,5 +375,11 @@ async fn send_one(http: &reqwest::Client, ep: &Endpoint, b64: &str) -> Result<St
     v.get("result")
         .and_then(|r| r.as_str())
         .map(|s| s.to_string())
-        .ok_or_else(|| anyhow!("{} нет result", ep.name))
+        .ok_or_else(|| {
+            // Показываем ТЕЛО ответа: «нет result» само по себе ничего не говорит,
+            // а релей может отказать по своей причине (мало tip, не тот тариф,
+            // троттлинг) и вернуть её в поле, которого мы не ждали.
+            let snip: String = text.chars().take(200).collect();
+            anyhow!("{} нет result (HTTP {}): {}", ep.name, status, snip)
+        })
 }
