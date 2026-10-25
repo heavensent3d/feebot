@@ -226,6 +226,13 @@ pub struct StrategyConfig {
     /// порог имеет смысл только как ДОЛЯ.
     #[serde(default = "default_min_vault_fill_pct")]
     pub min_vault_fill_pct: f64,
+    /// НАСТОЯЩИЙ порог выплаты холдерам, в SOL. Поле `floorSol` из /api/vault им
+    /// не является (у большинства монет там 0.002), а сам OTC в интерфейсе пишет
+    /// «Fees stay here until they reach 0.10 SOL». Фактические выплаты это
+    /// подтверждают: по 30 монетам минимальная 0.0899 SOL, медиана 0.1904.
+    /// Используется как нижняя граница: берём max(этого значения, floorSol).
+    #[serde(default = "default_payout_floor_sol")]
+    pub payout_floor_sol: f64,
     /// Жёсткий потолок трат на пролив за одну позицию. Исчерпали → НЕ бейлим, а
     /// падаем в дешёвый опрос (шанс поймать реворд остаётся, деньги не горят).
     #[serde(default = "default_exit_spam_max_sol")]
@@ -264,6 +271,9 @@ fn default_exit_spam_max_sol() -> f64 {
 }
 fn default_min_vault_fill_pct() -> f64 {
     50.0
+}
+fn default_payout_floor_sol() -> f64 {
+    0.10
 }
 fn default_exit_spam_window_secs() -> u64 {
     60

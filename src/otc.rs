@@ -122,6 +122,29 @@ pub struct OtcVault {
     pub graduated: bool,
 }
 
+impl OtcVault {
+    /// НАСТОЯЩИЙ порог выплаты холдерам, в SOL.
+    ///
+    /// ⚠️ `floorSol` из API им НЕ является. Замер 25.10.2026 по 70 монетам: у 61
+    /// он равен 0.002, у 9 — 0.1, тогда как сам OTC в интерфейсе монеты пишет
+    /// «Fees stay here until they reach 0.10 SOL, then the whole balance is
+    /// swapped at once». Фактические выплаты по 30 монетам это подтверждают:
+    /// минимальная 0.0899 SOL, медиана 0.1904, 29 из 30 не ниже 0.10, и НИ ОДНОЙ
+    /// около 0.002.
+    ///
+    /// На этом бот брал мёртвые монеты: деля на 0.002 вместо 0.10, он видел
+    /// «котёл заполнен 87.8%» там, где накоплено было 0.65% от выплаты.
+    /// Берём максимум из настроечного порога и того, что отдал API.
+    pub fn payout_floor(&self, cfg_floor_sol: f64) -> f64 {
+        self.floor_sol.max(cfg_floor_sol).max(1e-9)
+    }
+
+    /// Насколько котёл полон относительно НАСТОЯЩЕГО порога выплаты, в процентах.
+    pub fn fill_pct(&self, cfg_floor_sol: f64) -> f64 {
+        100.0 * self.waiting_sol / self.payout_floor(cfg_floor_sol)
+    }
+}
+
 impl OtcClient {
     pub fn new(cfg: &OtcConfig) -> Self {
         Self {

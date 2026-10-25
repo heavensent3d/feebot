@@ -19,7 +19,7 @@ use crate::jupiter::Jupiter;
 use crate::lighthouse::{assert_account_lamports, assert_token_amount, Op};
 use crate::nonce;
 use crate::oracle::{Candidate, Oracle};
-use crate::programs::{TOKEN_2022_PROGRAM, WSOL_MINT};
+use crate::programs::{TOKEN_2022_PROGRAM, TOKEN_PROGRAM, WSOL_MINT};
 use crate::pumpfun;
 use crate::pumpswap;
 use crate::relay::RelaySet;
@@ -449,12 +449,20 @@ impl Bot {
         let curve = curve.unwrap();
         let creator = curve.creator;
 
-        // НАШ ATA под reward-сток (Token-2022). Гейт выхода смотрит именно на него:
+        // Token-программа REWARD-СТОКА. Её НЕЛЬЗЯ хардкодить в Token-2022: стоки
+        // бывают и обычные SPL Token (например ZEC). На этом бот терял каждую
+        // такую монету — создание reward-ATA падало с IncorrectProgramId внутри
+        // Token-2022 (GetAccountDataSize на чужом минте), и покупка не проходила.
+        // Хуже того, от программы зависит АДРЕС ATA, то есть Lighthouse-гейт
+        // сторожил бы несуществующий аккаунт и выход не сработал бы никогда.
+        let reward_tp = pumpfun::coin_token_program(&self.rpc, &c.reward_mint).await;
+
+        // НАШ ATA под reward-сток. Гейт выхода смотрит именно на него:
         // «нам начислили сток» — безопасный сигнал, что раунд нас зачёл.
         let our_reward_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
             &self.payer.pubkey(),
             &c.reward_mint,
-            &TOKEN_2022_PROGRAM,
+            &reward_tp,
         );
         let reward_baseline = self.rpc.token_amount(&our_reward_ata).await.unwrap_or(0);
 
@@ -494,15 +502,12 @@ impl Bot {
                 // быть идеальной по капе/холдерам/истории выплат и всё равно быть
                 // убыточной ПРЯМО СЕЙЧАС. Фильтруем долей, а не абсолютом:
                 // floorSol у монет разный (видели 0.002 и 0.1).
-                let fill = if v.floor_sol > 0.0 {
-                    100.0 * v.waiting_sol / v.floor_sol
-                } else {
-                    0.0
-                };
+                let floor = v.payout_floor(self.cfg.strategy.payout_floor_sol);
+                let fill = v.fill_pct(self.cfg.strategy.payout_floor_sol);
                 if fill < self.cfg.strategy.min_vault_fill_pct {
                     info!(
-                        "{mint}: котёл заполнен {fill:.1}% (нужно ≥{:.0}%, {:.4}/{:.4} SOL) — раунд не успеет, скип",
-                        self.cfg.strategy.min_vault_fill_pct, v.waiting_sol, v.floor_sol
+                        "{mint}: котёл заполнен {fill:.1}% (нужно ≥{:.0}%, {:.4}/{floor:.4} SOL) — раунд не успеет, скип",
+                        self.cfg.strategy.min_vault_fill_pct, v.waiting_sol
                     );
                     // ⚠️ НЕ ставим кулдаун recent_trade: это «раунд не близко ПРЯМО
                     // СЕЙЧАС», а не «мы только что торговали». Котёл наполняется за
@@ -511,8 +516,8 @@ impl Bot {
                     // в 120-секундный бан, и бот замолчал бы без причины.
                     return Ok(());
                 }
-                info!("{mint}: котёл заполнен {fill:.1}% ({:.4}/{:.4} SOL) — раунд близко, входим",
-                      v.waiting_sol, v.floor_sol);
+                info!("{mint}: котёл заполнен {fill:.1}% ({:.4}/{floor:.4} SOL) — раунд близко, входим",
+                      v.waiting_sol);
             }
             // Котёл не прочитался — не блокируем вход, идём дальше.
             Err(_) => {}
@@ -539,12 +544,12 @@ impl Bot {
                 }
             },
         };
-        // ATA мемкоина (его token-программа) + ATA reward-стока (Token-2022).
+        // ATA мемкоина и ATA reward-стока — КАЖДЫЙ под своей token-программой.
         let coin_ata_ix = spl_associated_token_account::instruction::create_associated_token_account_idempotent(
             &me, &me, &mint, &coin_tp,
         );
         let reward_ata_ix = spl_associated_token_account::instruction::create_associated_token_account_idempotent(
-            &me, &me, &c.reward_mint, &TOKEN_2022_PROGRAM,
+            &me, &me, &c.reward_mint, &reward_tp,
         );
         // BUY полностью из деривации (18 аккаунтов) + coin_fee. Сверено байт-в-байт.
         let buy_ix = pumpfun::build_buy_exact(&me, &mint, &creator, &coin_tp, &fees, buy_lamports, min_tokens);
@@ -945,10 +950,18 @@ impl Bot {
         Ok((false, attempts, sell_amount))
     }
 
-    /// Сброс накопленных reward-стоков (Token-2022) в SOL через Jupiter.
+    /// Сброс накопленных reward-стоков в SOL через Jupiter.
+    ///
+    /// Сканируем ОБЕ token-программы: стоки бывают и Token-2022, и обычные SPL
+    /// Token (ZEC и подобные). Раньше смотрели только Token-2022 — заработанные
+    /// legacy-реворды просто лежали на кошельке непроданными.
     pub async fn sell_rewards(&self) -> Result<()> {
         let owner = self.payer.pubkey();
-        let accs = self.rpc.token_accounts(&owner, &TOKEN_2022_PROGRAM).await?;
+        let mut accs = self.rpc.token_accounts(&owner, &TOKEN_2022_PROGRAM).await?;
+        match self.rpc.token_accounts(&owner, &TOKEN_PROGRAM).await {
+            Ok(mut legacy) => accs.append(&mut legacy),
+            Err(e) => warn!("sell_rewards: не прочитать legacy-токены: {e}"),
+        }
         let min_lamports = (self.jup.cfg().min_reward_sol * LAMPORTS_PER_SOL) as u64;
 
         for ta in accs {
@@ -1034,14 +1047,18 @@ impl Bot {
             match self.oracle.vault(&mint_s).await {
                 Ok(v) => {
                     blind = 0;
-                    let jump = v.floor_sol * frac;
+                    // Порог — НАСТОЯЩИЙ (0.10 SOL), а не floorSol из API: см.
+                    // OtcVault::payout_floor. Иначе триггер считал бы от числа в
+                    // 50 раз меньше и срабатывал на пустом котле.
+                    let floor = v.payout_floor(self.cfg.strategy.payout_floor_sol);
+                    let jump = floor * frac;
                     // Котёл ДОШЁЛ до порога — раздача должна случиться вот-вот,
                     // это сам по себе триггер. Ждать тут «скачка» нельзя: раздача
                     // срабатывает ровно на пороге, и дальше котёл не растёт.
-                    if v.waiting_sol >= v.floor_sol && v.floor_sol > 0.0 {
+                    if v.waiting_sol >= floor {
                         info!(
-                            "EXIT {mint}: ТРИГГЕР — котёл дошёл до порога ({:.4}/{:.4} SOL), раздача вот-вот",
-                            v.waiting_sol, v.floor_sol
+                            "EXIT {mint}: ТРИГГЕР — котёл дошёл до порога ({:.4}/{floor:.4} SOL), раздача вот-вот",
+                            v.waiting_sol
                         );
                         return true;
                     }
@@ -1051,8 +1068,8 @@ impl Bot {
                             // Резкий рост = воркер закинул фисы в котёл (прекурсор).
                             if v.waiting_sol - prev >= jump && jump > 0.0 {
                                 info!(
-                                    "EXIT {mint}: ТРИГГЕР — котёл {prev:.4}→{:.4} SOL (скачок ≥{jump:.4}, порог {:.4}), раздача на подходе",
-                                    v.waiting_sol, v.floor_sol
+                                    "EXIT {mint}: ТРИГГЕР — котёл {prev:.4}→{:.4} SOL (скачок ≥{jump:.4}, порог {floor:.4}), раздача на подходе",
+                                    v.waiting_sol
                                 );
                                 return true;
                             }
