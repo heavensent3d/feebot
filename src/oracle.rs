@@ -58,6 +58,18 @@ impl Oracle {
         }
     }
 
+    /// Когда воркер OTC последний раз клеймил фисы в котёл — ПРЕКУРСОР раздачи
+    /// (от клейма до раздачи ~37с). Рост этого числа = пора лить пролив.
+    pub async fn last_claim_at(&self, mint: &str) -> Option<u64> {
+        let c = self.otc.coin_detail(mint).await.ok()?;
+        let r = c.rewards?;
+        if r.last_claim_at > 0 {
+            Some(r.last_claim_at)
+        } else {
+            None
+        }
+    }
+
     /// Котёл монеты (waitingSol / floorSol) — прекурсор раздачи для гонки выхода.
     pub async fn vault(&self, mint: &str) -> anyhow::Result<crate::otc::OtcVault> {
         self.otc.vault(mint).await

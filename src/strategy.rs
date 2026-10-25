@@ -1042,8 +1042,26 @@ impl Bot {
         let poll = poll_ms(self.cfg.strategy.exit_trigger_poll_ms);
         let mut base: Option<f64> = None;
         let mut blind = 0u32;
-        info!("EXIT {mint}: ждём прекурсор раздачи (котёл дошёл до порога либо скачок ≥{:.0}% порога), пролив пока не льём", frac * 100.0);
+        // ГЛАВНЫЙ прекурсор — клейм воркера (`rewards.lastClaimAt`): от него до
+        // раздачи ~37с. Запоминаем, что было на входе, и ждём РОСТА.
+        let mut claim_base = self.oracle.last_claim_at(&mint_s).await;
+        info!(
+            "EXIT {mint}: ждём прекурсор раздачи (клейм воркера либо скачок котла ≥{:.0}% порога), пролив пока не льём",
+            frac * 100.0
+        );
         while std::time::Instant::now() < deadline {
+            // 1) Клейм воркера — точный сигнал, что раздача через десятки секунд.
+            if let Some(now_claim) = self.oracle.last_claim_at(&mint_s).await {
+                match claim_base {
+                    None => claim_base = Some(now_claim),
+                    Some(prev) if now_claim > prev => {
+                        info!("EXIT {mint}: ТРИГГЕР — воркер склеймил фисы (lastClaimAt {prev}→{now_claim}), раздача на подходе");
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+            // 2) Запасной сигнал — резкий рост котла.
             match self.oracle.vault(&mint_s).await {
                 Ok(v) => {
                     blind = 0;
@@ -1052,16 +1070,12 @@ impl Bot {
                     // 50 раз меньше и срабатывал на пустом котле.
                     let floor = v.payout_floor(self.cfg.strategy.payout_floor_sol);
                     let jump = floor * frac;
-                    // Котёл ДОШЁЛ до порога — раздача должна случиться вот-вот,
-                    // это сам по себе триггер. Ждать тут «скачка» нельзя: раздача
-                    // срабатывает ровно на пороге, и дальше котёл не растёт.
-                    if v.waiting_sol >= floor {
-                        info!(
-                            "EXIT {mint}: ТРИГГЕР — котёл дошёл до порога ({:.4}/{floor:.4} SOL), раздача вот-вот",
-                            v.waiting_sol
-                        );
-                        return true;
-                    }
+                    // ⚠️ Полнота котла — условие ВХОДА, а НЕ старта пролива. Мы и
+                    // входим-то только когда котёл близок к порогу, так что проверка
+                    // «котёл ≥ порога» срабатывала бы мгновенно на каждой позиции.
+                    // Именно это сожгло весь бюджет (0.08 SOL за 41 секунду) при
+                    // котле 148% — воркер приходит по своему расписанию и может
+                    // тянуть минутами. Старт пролива даёт только КЛЕЙМ воркера.
                     match base {
                         None => base = Some(v.waiting_sol),
                         Some(prev) => {
