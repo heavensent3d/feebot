@@ -645,7 +645,49 @@ impl Bot {
             return Ok((false, 0, sell_amount));
         }
 
-        // ── ХОЛД ДО РАУНДА ──
+        // ── ГОНКА ВЫХОДА (пре-подписанный гейтованный sell + непрерывный пролив) ──
+        // Реверс работающего бота: конкуренты льют 300-500 падающих продаж/сек,
+        // чтобы исполниться В ПЕРВОМ СЛОТЕ после раздачи. Опоздал на 2 секунды —
+        // продал в −21% вместо −1.4%. Поэтому НЕ «ждём и шлём одну», а держим
+        // заранее подписанную гейтованную продажу и непрерывно её льём: пока
+        // реворда нет, гейт роняет её за base fee (tip при этом НЕ списывается).
+        if self.cfg.strategy.exit_spam_tps > 0 {
+            if let Some(ix) = sell_ix.clone() {
+                let (sold, tries) = self
+                    .spam_gated_exit(&mint, &user_ata, reward_ata, threshold, bal, ix)
+                    .await;
+                if sold {
+                    info!("EXIT {mint}: ПРОДАНО В ГОНКЕ (попыток {tries})");
+                    return Ok((true, tries, sell_amount));
+                }
+                warn!("EXIT {mint}: гонка не дала результата за {}с (попыток {tries}) → бейл", self.cfg.strategy.hold_max_secs);
+                // Раздачи не случилось — аварийно выходим по слиппедж-полу.
+                let floor = cost_lamports.saturating_mul(self.cfg.strategy.bail_floor_bps) / 10_000;
+                let bail = pumpfun::build_sell_derived(&me, &mint, &creator, &coin_tp, fees, sell_amount, floor);
+                for _ in 0..10 {
+                    let mut ixs: Vec<Instruction> = compute_budget(
+                        self.cfg.strategy.sell_cu_limit,
+                        self.cfg.strategy.sell_cu_price,
+                    )
+                    .to_vec();
+                    ixs.push(bail.clone());
+                    if let Ok(bh) = self.rpc.latest_blockhash().await {
+                        let _ = self.relays.broadcast_build(&self.payer, &ixs, bh, &no_alts(), &[]).await;
+                    }
+                    if let Ok(now) = self.rpc.token_amount(&user_ata).await {
+                        if now == 0 || now < bal / 2 {
+                            info!("EXIT {mint}: закрыто бейлом (остаток {now})");
+                            return Ok((true, tries, sell_amount));
+                        }
+                    }
+                    tokio::time::sleep(poll).await;
+                }
+                warn!("EXIT {mint}: бейл не прошёл — позиция висит, разбирайся вручную");
+                return Ok((false, tries, sell_amount));
+            }
+        }
+
+        // ── ХОЛД ДО РАУНДА (запасной путь, если пролив выключен) ──
         // Раунды OTC атомарны (своп+раздача в одной tx) — влезть в гэп нельзя, надо
         // быть холдером ДО раунда. Поэтому ДЕРЖИМ монету и ждём, пока раунд начислит
         // сток на наш reward-ATA (shred-будилка + дешёвый опрос). Как начислил —
@@ -850,6 +892,86 @@ impl Bot {
 
     // ───────── helpers ─────────
 
+    /// ГОНКА ВЫХОДА: держим заранее подписанную гейтованную продажу и льём её с
+    /// частотой `exit_spam_tps`, пока раздача не начислит реворд — тогда гейт
+    /// пропускает и мы исполняемся в первом же слоте, раньше конкурентов.
+    /// Пока реворда нет, каждая попытка падает на гейте и стоит только base fee
+    /// (tip внутри упавшей tx НЕ списывается). Возвращает (продано, попыток).
+    async fn spam_gated_exit(
+        &self,
+        mint: &Pubkey,
+        user_ata: &Pubkey,
+        reward_ata: &Pubkey,
+        threshold: u64,
+        bal: u64,
+        sell_ix: Instruction,
+    ) -> (bool, u64) {
+        let tps = self.cfg.strategy.exit_spam_tps.max(1);
+        let gap = std::time::Duration::from_micros(1_000_000 / tps as u64);
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(self.cfg.strategy.hold_max_secs);
+        let resign = std::time::Duration::from_secs(self.cfg.strategy.exit_resign_secs.max(5));
+        let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut cached: Option<Vec<crate::relay::CachedTx>> = None;
+        let mut signed_at = std::time::Instant::now();
+        let mut last_check = std::time::Instant::now();
+        info!("EXIT {mint}: гонка — льём гейтованную продажу {tps} tx/с до раздачи");
+
+        loop {
+            if std::time::Instant::now() >= deadline {
+                return (false, attempts.load(std::sync::atomic::Ordering::Relaxed));
+            }
+            // Переподписываем пролив: blockhash живёт ~60-90с.
+            if cached.is_none() || signed_at.elapsed() >= resign {
+                let mut ixs: Vec<Instruction> = compute_budget(
+                    self.cfg.strategy.sell_cu_limit,
+                    self.cfg.strategy.sell_cu_price,
+                )
+                .to_vec();
+                // Гейт: исполниться только когда раздача начислила нам сток.
+                ixs.push(assert_token_amount(reward_ata, threshold, Op::Gte));
+                ixs.push(sell_ix.clone());
+                match self.rpc.latest_blockhash().await {
+                    Ok(bh) => match self.relays.build_cached(&self.payer, &ixs, bh, &no_alts(), &[]) {
+                        Ok(c) => {
+                            cached = Some(c);
+                            signed_at = std::time::Instant::now();
+                        }
+                        Err(e) => {
+                            warn!("EXIT {mint}: не подписать пролив: {e}");
+                            tokio::time::sleep(poll_ms(self.cfg.strategy.poll_ms)).await;
+                            continue;
+                        }
+                    },
+                    Err(e) => {
+                        warn!("EXIT {mint}: нет blockhash: {e}");
+                        tokio::time::sleep(poll_ms(self.cfg.strategy.poll_ms)).await;
+                        continue;
+                    }
+                }
+            }
+            // Один «выстрел» — не ждём ответа, чтобы держать частоту.
+            if let Some(c) = cached.clone() {
+                let relays = self.relays.clone();
+                let a = Arc::clone(&attempts);
+                tokio::spawn(async move {
+                    let _ = relays.send_cached(&c).await;
+                    a.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                });
+            }
+            // Раз в ~секунду проверяем, не продались ли уже.
+            if last_check.elapsed() >= std::time::Duration::from_millis(1000) {
+                last_check = std::time::Instant::now();
+                if let Ok(now) = self.rpc.token_amount(user_ata).await {
+                    if now == 0 || now < bal / 2 {
+                        return (true, attempts.load(std::sync::atomic::Ordering::Relaxed));
+                    }
+                }
+            }
+            tokio::time::sleep(gap).await;
+        }
+    }
+
     /// Текущий профит позиции в % к затратам: (монета по кривой + полученный
     /// реворд по котировке) / стоимость входа − 1. None, если данных не хватает.
     async fn position_profit_pct(
@@ -914,4 +1036,9 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Период опроса как Duration (мелкий хелпер для пролива).
+fn poll_ms(ms: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(ms.max(50))
 }
