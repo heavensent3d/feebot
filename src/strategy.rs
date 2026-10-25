@@ -285,6 +285,14 @@ impl Bot {
         let total = cands.len();
         let (mut sk_active, mut sk_cooldown, mut sk_rounds, mut sk_notpl) = (0, 0, 0, 0);
         let (mut sk_pre1, mut sk_pre2, mut sk_float, mut sk_eval, mut sk_rmint) = (0, 0, 0, 0, 0);
+        // Копим ПРИЧИНЫ отказа: номер этапа мало что говорит, тюнить можно только
+        // по конкретному условию, которое режет.
+        let mut reasons: HashMap<String, usize> = HashMap::new();
+        let mut note = |r: &mut HashMap<String, usize>, s: String| {
+            // Отрезаем числа из текста, чтобы причины группировались.
+            let key = s.split(|ch: char| ch.is_ascii_digit()).collect::<Vec<_>>().join("");
+            *r.entry(key.trim().to_string()).or_insert(0) += 1;
+        };
         for mut c in cands {
             // Нет свободного слота — дальше перебирать незачем.
             if self.slots.available_permits() == 0 {
@@ -324,8 +332,9 @@ impl Bot {
                 }
             }
             // Дешёвый прескрин без RPC (капа/объём/ликвидность) — до per-coin запроса.
-            if matches!(self.filters.prescreen(&c), Verdict::Skip(_)) {
+            if let Verdict::Skip(r) = self.filters.prescreen(&c) {
                 sk_pre1 += 1;
+                note(&mut reasons, r);
                 continue;
             }
             // Догружаем rewards (owed / distributed / lastPaidHolders) — объект приходит
@@ -340,8 +349,9 @@ impl Bot {
                 c.last_payout_age_secs = payout_age;
             }
             // Прескрин ещё раз — теперь с rewards-гейтами (роздано / холдеры / обвал).
-            if let Verdict::Skip(_r) = self.filters.prescreen(&c) {
+            if let Verdict::Skip(r) = self.filters.prescreen(&c) {
                 sk_pre2 += 1;
+                note(&mut reasons, r);
                 continue;
             }
             // Реальный он-чейн флоат только для прошедших прескрин (экономим RPC).
@@ -354,8 +364,9 @@ impl Bot {
                 }
             }
             match self.filters.evaluate(&c, buy_sol, sol_price, float_override) {
-                Verdict::Skip(_reason) => {
+                Verdict::Skip(r) => {
                     sk_eval += 1;
+                    note(&mut reasons, r);
                     continue;
                 }
                 Verdict::Take => {}
@@ -405,6 +416,12 @@ impl Bot {
                  прескрин {sk_pre1}, реворды {sk_pre2}, флоат {sk_float}, EV {sk_eval}, \
                  сток занят {sk_rmint}"
             );
+            let mut top: Vec<_> = reasons.into_iter().collect();
+            top.sort_by(|a, b| b.1.cmp(&a.1));
+            let top: Vec<String> = top.iter().take(5).map(|(r, n)| format!("{r} ×{n}")).collect();
+            if !top.is_empty() {
+                info!("tick: что именно режет — {}", top.join(" | "));
+            }
         }
         if considered > 0 {
             info!("tick: открыто попыток входа {considered}");
