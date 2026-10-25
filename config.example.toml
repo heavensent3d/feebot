@@ -34,21 +34,25 @@ keypair_path = "C:/Users/you/.config/solana/feebot.json"
 # откатывается вместе со стейтом — платим его только за выигравшую продажу.
 [[relays]]
 name = "helius-fra"
-url = "http://fra-sender.helius-rpc.com/fast?api-key=YOUR_HELIUS_KEY"
+url = "http://fra-sender.helius-rpc.com/fast?api-key=YOUR_HELIUS_KEY&swqos_only=true"
 kind = "constant-k"
+# ОБЯЗАТЕЛЬНО &swqos_only=true в URL: без него эндпоинт работает в режиме
+# Sender Max, где минимум типа 0.001 SOL, и транзакция с меньшим типом молча
+# отбивается ответом без result. Конкурент, обогнавший нас на 8 слотов, шёл
+# именно на SWQOS-only с типом 0.000005.
 tip_lamports = 5000           # SWQOS-минимум: tip очередь НЕ покупает, её покупает CU price
 tip_account = "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE"
 
 [[relays]]
 name = "helius-ams"
-url = "http://ams-sender.helius-rpc.com/fast?api-key=YOUR_HELIUS_KEY"
+url = "http://ams-sender.helius-rpc.com/fast?api-key=YOUR_HELIUS_KEY&swqos_only=true"
 kind = "constant-k"
 tip_lamports = 5000
 tip_account = "D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ"
 
 [[relays]]
 name = "helius-lon"
-url = "http://lon-sender.helius-rpc.com/fast?api-key=YOUR_HELIUS_KEY"
+url = "http://lon-sender.helius-rpc.com/fast?api-key=YOUR_HELIUS_KEY&swqos_only=true"
 kind = "constant-k"
 tip_lamports = 5000
 tip_account = "9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta"
