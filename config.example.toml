@@ -164,7 +164,7 @@ exit_resign_secs = 40         # переподписывать пролив св
 exit_spam_max_sol = 0.08      # потолок трат на пролив за позицию (≈30с окна на 120 tx/с)
 exit_spam_window_secs = 60    # сколько лить после триггера (у воркера клейм→раздача ~37с)
 exit_trigger_poll_ms = 1200   # опрос котла /api/vault (бесплатный HTTP, не RPC)
-exit_trigger_jump_sol = 0.005 # скачок waitingSol = клейм воркера = раздача на подходе
+exit_trigger_jump_frac = 0.3   # скачок котла на 30% порога = клейм воркера (абсолют был мёртв)
 # nonce_account = "<durable nonce pubkey>"   # опц., для долгоживущего выхода (feebot init-nonce)
 # tip на вход/выход задаётся per-relay (см. [[relays]]), а не здесь.
 

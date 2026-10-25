@@ -238,9 +238,16 @@ pub struct StrategyConfig {
     #[serde(default = "default_exit_trigger_poll_ms")]
     pub exit_trigger_poll_ms: u64,
     /// Насколько должен подскочить `waitingSol`, чтобы считать это клеймом воркера
-    /// (прекурсор раздачи). 0 → лить сразу, как котёл выше floorSol.
-    #[serde(default = "default_exit_trigger_jump_sol")]
-    pub exit_trigger_jump_sol: f64,
+    /// (прекурсор раздачи) — ДОЛЯ от `floorSol`, не абсолют. 0 → триггер выключен.
+    ///
+    /// Было абсолютное `exit_trigger_jump_sol = 0.005`, и на первой же живой
+    /// позиции это оказалось мертво: у STOCKS `floorSol = 0.002`, то есть мы
+    /// требовали скачок в 2.5 раза БОЛЬШЕ всей суммы, при которой раздача вообще
+    /// происходит. Триггер не мог сработать никогда, пролив не начинался, и
+    /// позиция ушла бы в бейл по таймауту. Порог котла у монет разный (видели
+    /// 0.002 и 0.1), поэтому осмыслен только относительный.
+    #[serde(default = "default_exit_trigger_jump_frac")]
+    pub exit_trigger_jump_frac: f64,
 }
 
 fn default_exit_spam_tps() -> u32 {
@@ -264,8 +271,8 @@ fn default_exit_spam_window_secs() -> u64 {
 fn default_exit_trigger_poll_ms() -> u64 {
     1200
 }
-fn default_exit_trigger_jump_sol() -> f64 {
-    0.005
+fn default_exit_trigger_jump_frac() -> f64 {
+    0.3 // скачок на 30% порога = воркер закинул фисы в котёл
 }
 
 fn default_breakeven_exit_pct() -> f64 {

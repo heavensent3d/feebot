@@ -1021,37 +1021,44 @@ impl Bot {
         deadline: std::time::Instant,
         notify: &Notify,
     ) -> bool {
-        let jump = self.cfg.strategy.exit_trigger_jump_sol;
-        if jump <= 0.0 {
+        let frac = self.cfg.strategy.exit_trigger_jump_frac;
+        if frac <= 0.0 {
             return true; // триггер отключён — льём сразу
         }
         let mint_s = mint.to_string();
         let poll = poll_ms(self.cfg.strategy.exit_trigger_poll_ms);
         let mut base: Option<f64> = None;
         let mut blind = 0u32;
-        info!("EXIT {mint}: ждём прекурсор раздачи (скачок котла ≥{jump} SOL), пролив пока не льём");
+        info!("EXIT {mint}: ждём прекурсор раздачи (котёл дошёл до порога либо скачок ≥{:.0}% порога), пролив пока не льём", frac * 100.0);
         while std::time::Instant::now() < deadline {
             match self.oracle.vault(&mint_s).await {
                 Ok(v) => {
                     blind = 0;
-                    // Котёл ниже порога — раздаче физически не из чего случиться.
-                    if v.waiting_sol < v.floor_sol {
-                        base = Some(v.waiting_sol);
-                    } else {
-                        match base {
-                            None => base = Some(v.waiting_sol),
-                            Some(prev) => {
-                                if v.waiting_sol - prev >= jump {
-                                    info!(
-                                        "EXIT {mint}: ТРИГГЕР — котёл {prev:.4}→{:.4} SOL (порог {:.4}), раздача на подходе",
-                                        v.waiting_sol, v.floor_sol
-                                    );
-                                    return true;
-                                }
-                                // Котёл упал = раздача уже прошла без нас: новый отсчёт.
-                                if v.waiting_sol < prev {
-                                    base = Some(v.waiting_sol);
-                                }
+                    let jump = v.floor_sol * frac;
+                    // Котёл ДОШЁЛ до порога — раздача должна случиться вот-вот,
+                    // это сам по себе триггер. Ждать тут «скачка» нельзя: раздача
+                    // срабатывает ровно на пороге, и дальше котёл не растёт.
+                    if v.waiting_sol >= v.floor_sol && v.floor_sol > 0.0 {
+                        info!(
+                            "EXIT {mint}: ТРИГГЕР — котёл дошёл до порога ({:.4}/{:.4} SOL), раздача вот-вот",
+                            v.waiting_sol, v.floor_sol
+                        );
+                        return true;
+                    }
+                    match base {
+                        None => base = Some(v.waiting_sol),
+                        Some(prev) => {
+                            // Резкий рост = воркер закинул фисы в котёл (прекурсор).
+                            if v.waiting_sol - prev >= jump && jump > 0.0 {
+                                info!(
+                                    "EXIT {mint}: ТРИГГЕР — котёл {prev:.4}→{:.4} SOL (скачок ≥{jump:.4}, порог {:.4}), раздача на подходе",
+                                    v.waiting_sol, v.floor_sol
+                                );
+                                return true;
+                            }
+                            // Котёл упал = раздача уже прошла без нас: новый отсчёт.
+                            if v.waiting_sol < prev {
+                                base = Some(v.waiting_sol);
                             }
                         }
                     }
