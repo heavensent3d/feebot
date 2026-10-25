@@ -605,10 +605,14 @@ impl Default for JupiterConfig {
 }
 
 fn default_jup_quote() -> String {
-    "https://quote-api.jup.ag/v6/quote".into()
+    // ⚠️ quote-api.jup.ag/v6 МЁРТВ: с нашего VDS он не отвечает вовсе (HTTP 000),
+    // из-за чего КАЖДАЯ продажа реворда падала с «нет котировки» и заработанное
+    // просто лежало на кошельке. Проверено 25.10.2026: пойманный реворд стоил
+    // 0.2086 SOL, а сделка числилась убыточной. Актуальный путь — swap/v1.
+    "https://lite-api.jup.ag/swap/v1/quote".into()
 }
 fn default_jup_swap() -> String {
-    "https://quote-api.jup.ag/v6/swap".into()
+    "https://lite-api.jup.ag/swap/v1/swap".into()
 }
 fn default_reward_slippage() -> u64 {
     3000

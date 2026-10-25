@@ -210,8 +210,9 @@ reward_mint_denylist = []
 reward_mint_allowlist = []    # пусто = любой reward-сток
 
 [jupiter]
-quote_url = "https://quote-api.jup.ag/v6/quote"
-swap_url = "https://quote-api.jup.ag/v6/swap"
+# quote-api.jup.ag/v6 МЁРТВ (не отвечает) — каждая продажа реворда падала молча
+quote_url = "https://lite-api.jup.ag/swap/v1/quote"
+swap_url = "https://lite-api.jup.ag/swap/v1/swap"
 slippage_bps = 3000           # стоки неликвидные — шире
 min_reward_sol = 0.01         # ниже — считаем dust, не продаём
 
