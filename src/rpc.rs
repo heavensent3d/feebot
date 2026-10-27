@@ -29,14 +29,34 @@ impl Rpc {
         }
     }
 
+    /// Отправить тело JSON-RPC с ретраями на 429. Бесплатный тир отдаёт
+    /// «Too Many Requests» регулярно, и без ретраев это выглядело как «данных
+    /// нет»: скрейп coin_fee падал и уводил ВПОЛНЕ ЖИВУЮ монету в
+    /// no_template-кулдаун на 180 секунд. Rate-limit — это «спроси позже», а не
+    /// «такого нет».
+    async fn post_with_retry(&self, body: &serde_json::Value) -> Result<(reqwest::StatusCode, String)> {
+        let mut delay = std::time::Duration::from_millis(250);
+        for attempt in 0..4 {
+            let resp = self.rq.post(&self.http_url).json(body).send().await?;
+            let status = resp.status();
+            let text = resp.text().await?;
+            if status.as_u16() != 429 {
+                return Ok((status, text));
+            }
+            if attempt < 3 {
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+            }
+        }
+        Err(anyhow!("rpc: 429 после 4 попыток (rate-limit держится)"))
+    }
+
     /// Сырой JSON-RPC (для методов, где нужен разбор ответа руками, напр. шаблон tx).
     pub async fn raw(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
         let body = serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":params});
-        let resp = self.rq.post(&self.http_url).json(&body).send().await?;
-        let status = resp.status();
-        // Читаем текст и парсим вручную: на rate-limit/ошибке RPC отдаёт не-JSON
-        // (HTML/пусто), и resp.json() падал опаковым "error decoding response body".
-        let text = resp.text().await?;
+        let (status, text) = self.post_with_retry(&body).await?;
+        // Парсим вручную: на ошибке RPC отдаёт не-JSON (HTML/пусто), и
+        // resp.json() падал опаковым "error decoding response body".
         let v: serde_json::Value = serde_json::from_str(&text).map_err(|_| {
             let snip: String = text.chars().take(120).collect();
             anyhow!("rpc {method}: не-JSON ответ (HTTP {status}): {snip}")
@@ -64,9 +84,9 @@ impl Rpc {
             .enumerate()
             .map(|(i, (m, p))| serde_json::json!({"jsonrpc":"2.0","id":i,"method":m,"params":p}))
             .collect();
-        let resp = self.rq.post(&self.http_url).json(&body).send().await?;
-        let status = resp.status();
-        let text = resp.text().await?;
+        let (status, text) = self
+            .post_with_retry(&serde_json::Value::Array(body))
+            .await?;
         let v: serde_json::Value = serde_json::from_str(&text).map_err(|_| {
             let snip: String = text.chars().take(120).collect();
             anyhow!("rpc batch: не-JSON ответ (HTTP {status}): {snip}")
