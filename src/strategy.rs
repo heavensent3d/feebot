@@ -637,6 +637,22 @@ impl Bot {
                     // в 120-секундный бан, и бот замолчал бы без причины.
                     return Ok(());
                 }
+                // ФОРМУЛА КОТЛА ИЗ ЧЕЙНА. Фисы создателя pump копятся на PDA
+                // `creator-vault`, и именно их воркер OTC клеймит, а потом
+                // раздаёт холдерам. То есть пот можно посчитать САМОМУ, не
+                // дожидаясь, пока он проявится в их API, — а раннее знание и
+                // есть тот запас, на котором заходят за минуту до раздачи.
+                // Логируем обе величины рядом, чтобы сверить формулу на фактах.
+                if let Some(cu) = &curve {
+                    let vault_pda = pumpfun::creator_vault(&cu.creator);
+                    let onchain = self.rpc.lamports(&vault_pda).await.unwrap_or(0) as f64
+                        / LAMPORTS_PER_SOL;
+                    info!(
+                        "{mint}: котёл API {:.6} SOL | creator_vault в чейне {onchain:.6} SOL | разница {:+.6}",
+                        v.waiting_sol,
+                        onchain - v.waiting_sol
+                    );
+                }
                 info!("{mint}: котёл заполнен {fill:.1}% ({:.4}/{floor:.4} SOL) — раунд близко, входим",
                       v.waiting_sol);
             }
