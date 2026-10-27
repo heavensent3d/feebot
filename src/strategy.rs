@@ -87,7 +87,8 @@ pub struct Bot {
     /// это время успевают смениться. При 20 одновременных запросах тот же обход
     /// укладывается в 33 секунды, и тик может выбирать САМЫЙ полный котёл, а не
     /// первый попавшийся.
-    pot_cache: Arc<Mutex<HashMap<Pubkey, (f64, std::time::Instant)>>>,
+    /// mint → (заполнение %, котёл SOL, прирост SOL/мин, когда измерено).
+    pot_cache: Arc<Mutex<HashMap<Pubkey, (f64, f64, f64, std::time::Instant)>>>,
 }
 
 impl Bot {
@@ -292,9 +293,11 @@ const HOLDERS_CUT: f64 = 0.675;
                 }
             };
             let floor_cfg = self.cfg.strategy.payout_floor_sol;
-            let mut fresh: HashMap<Pubkey, (f64, std::time::Instant)> = HashMap::new();
+            let mut fresh: HashMap<Pubkey, (f64, f64, f64, std::time::Instant)> = HashMap::new();
             let mut it = cands.into_iter();
-            let mut set: tokio::task::JoinSet<Option<(Pubkey, f64)>> = tokio::task::JoinSet::new();
+            let prev = self.pot_cache.lock().await.clone();
+            let mut set: tokio::task::JoinSet<Option<(Pubkey, f64, f64)>> =
+                tokio::task::JoinSet::new();
             loop {
                 // Держим ровно `conc` запросов в полёте.
                 while set.len() < conc {
@@ -305,12 +308,25 @@ const HOLDERS_CUT: f64 = 0.675;
                         if v.graduated {
                             return None;
                         }
-                        Some((c.mint, v.fill_pct(floor_cfg)))
+                        Some((c.mint, v.fill_pct(floor_cfg), v.waiting_sol))
                     });
                 }
                 match set.join_next().await {
-                    Some(Ok(Some((mint, fill)))) => {
-                        fresh.insert(mint, (fill, std::time::Instant::now()));
+                    Some(Ok(Some((mint, fill, pot)))) => {
+                        // СКОРОСТЬ НАПОЛНЕНИЯ — главный признак живого котла.
+                        // Замер 27.10.2026: из 18 монет котёл рос только у ДВУХ,
+                        // остальные стояли намертво, включая монеты с объёмом
+                        // $10 943 и $8 026. volume24h ничего не предсказывает —
+                        // это суточный агрегат, монета могла торговаться вчера.
+                        let now = std::time::Instant::now();
+                        let rate = prev
+                            .get(&mint)
+                            .map(|(_, old_pot, _, t)| {
+                                let mins = t.elapsed().as_secs_f64() / 60.0;
+                                if mins > 0.05 { (pot - old_pot) / mins } else { 0.0 }
+                            })
+                            .unwrap_or(0.0);
+                        fresh.insert(mint, (fill, pot, rate, now));
                     }
                     Some(_) => {}
                     None => break,
@@ -318,10 +334,11 @@ const HOLDERS_CUT: f64 = 0.675;
             }
             let ready = fresh
                 .values()
-                .filter(|(f, _)| *f >= self.cfg.strategy.min_vault_fill_pct)
+                .filter(|(f, _, _, _)| *f >= self.cfg.strategy.min_vault_fill_pct)
                 .count();
+            let growing = fresh.values().filter(|(_, _, r, _)| *r > 1e-9).count();
             info!(
-                "обход котлов: {} монет за {:.1}с, готовых к входу {ready}",
+                "обход котлов: {} монет за {:.1}с, за порогом {ready}, РАСТУЩИХ {growing}",
                 fresh.len(),
                 started.elapsed().as_secs_f64()
             );
@@ -347,10 +364,16 @@ const HOLDERS_CUT: f64 = 0.675;
         {
             let pots = self.pot_cache.lock().await;
             if !pots.is_empty() {
+                // Сначала РАСТУЩИЕ котлы, потом по заполнению. Стоячий котёл за
+                // порогом может висеть часами: воркер ходит пачками, а в пачку
+                // попадают живые монеты.
                 cands.sort_by(|a, b| {
-                    let fa = pots.get(&a.mint).map(|(f, _)| *f).unwrap_or(-1.0);
-                    let fb = pots.get(&b.mint).map(|(f, _)| *f).unwrap_or(-1.0);
-                    fb.partial_cmp(&fa).unwrap_or(std::cmp::Ordering::Equal)
+                    let ka = pots.get(&a.mint).map(|(f, _, r, _)| (*r > 1e-9, *f));
+                    let kb = pots.get(&b.mint).map(|(f, _, r, _)| (*r > 1e-9, *f));
+                    let ka = ka.unwrap_or((false, -1.0));
+                    let kb = kb.unwrap_or((false, -1.0));
+                    kb.0.cmp(&ka.0)
+                        .then(kb.1.partial_cmp(&ka.1).unwrap_or(std::cmp::Ordering::Equal))
                 });
             }
         }
