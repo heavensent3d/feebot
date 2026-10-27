@@ -624,6 +624,15 @@ impl Bot {
                     f
                 }
                 Err(e) => {
+                    // Rate-limit RPC — это «спроси позже», а НЕ «шаблона нет».
+                    // Раньше 429 уводил вполне живую монету в кулдаун на 180
+                    // секунд, и мы теряли ровно тех кандидатов, до которых
+                    // дошла очередь в момент нагрузки.
+                    let msg = format!("{e:#}");
+                    if msg.contains("429") || msg.contains("Too Many") {
+                        warn!("{mint}: RPC занят ({e}) — попробуем позже, БЕЗ кулдауна");
+                        return Ok(());
+                    }
                     info!("{mint}: нет coin_fee ({e}) — пропуск позиции (кулдаун {}s)", Self::NO_TEMPLATE_COOLDOWN_SECS);
                     self.no_template
                         .lock()
