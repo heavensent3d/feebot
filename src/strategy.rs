@@ -599,6 +599,10 @@ const HOLDERS_CUT: f64 = 0.675;
         let tokens_out = curve.tokens_out_for_sol(buy_lamports);
         let min_tokens = tokens_out - tokens_out * self.cfg.strategy.slippage_bps / 10_000;
 
+        // Ожидаемый фис, посчитанный из чейна ДО входа. Храним, чтобы при
+        // закрытии сверить прогноз с фактом — без этого сверка собирается
+        // глазами по разным строкам лога и врёт.
+        let mut expected_reward_sol = 0.0f64;
         // ── КОТЁЛ МОНЕТЫ: один бесплатный HTTP, два решения о входе ──
         // Делаем ДО кэша coin_fee, потому что это решение про КАЖДЫЙ вход, а не
         // про разовый скрейп: монета с закэшированными фисами всё равно обязана
@@ -677,6 +681,7 @@ const HOLDERS_CUT: f64 = 0.675;
                 };
                 let share_frac = c.share_frac.unwrap_or(1.0);
                 let expected_reward = pot_sol * Self::HOLDERS_CUT * share_frac;
+                expected_reward_sol = expected_reward;
                 info!(
                     "{mint}: ОЖИДАЕМЫЙ ФИС {expected_reward:.4} SOL (пот {pot_sol:.4} × {:.1}% холдерам × наша доля {:.0}%)",
                     Self::HOLDERS_CUT * 100.0,
@@ -799,7 +804,7 @@ const HOLDERS_CUT: f64 = 0.675;
         self.set_busy(false);
         let (closed, attempts, sell_amount) = r?;
         if closed && !self.cfg.strategy.dry_run {
-            self.emit_report(&c, &our_reward_ata, reward_baseline, lamports_before, attempts)
+            self.emit_report(&c, &our_reward_ata, reward_baseline, lamports_before, attempts, expected_reward_sol)
                 .await;
         }
         Ok(())
@@ -813,6 +818,7 @@ const HOLDERS_CUT: f64 = 0.675;
         reward_baseline: u64,
         lamports_before: u64,
         attempts: u64,
+        expected_reward_sol: f64,
     ) {
         let sol_price = self.sol_price_usd().await;
         // ФАКТИЧЕСКАЯ дельта кошелька за сделку, а не расчёт по кривой.
@@ -876,6 +882,16 @@ const HOLDERS_CUT: f64 = 0.675;
             net_usd: net_sol * sol_price,
             closed_at: now_unix(),
         };
+        // СВЕРКА ПРОГНОЗА С ФАКТОМ. Формула фиса (пот creator-vault × 0.675 ×
+        // наша доля) считается до входа, и только это сравнение показывает,
+        // работает ли она на самом деле.
+        if expected_reward_sol > 0.0 {
+            let ratio = 100.0 * reward_value_sol / expected_reward_sol;
+            info!(
+                "СВЕРКА {}: ожидали фис {expected_reward_sol:.4} SOL, получили {reward_value_sol:.4} SOL ({ratio:.0}% от прогноза)",
+                c.symbol.as_deref().unwrap_or("?")
+            );
+        }
         self.reporter.report_trade(&rep).await;
     }
 
