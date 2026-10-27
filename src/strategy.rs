@@ -442,12 +442,44 @@ impl Bot {
             }
             // Реальный он-чейн флоат только для прошедших прескрин (экономим RPC).
             let float_override = self.float_override(&c, sol_price).await;
-            // Эдж = КРОШЕЧНЫЙ флоат (наша доля большая). Над порогом доля мелкая → скип.
+            // ДОЛЯ В ВЫПЛАТЕ — это и есть весь заработок. Реворд делится
+            // пропорционально токенам, поэтому важен не абсолютный флоат, а
+            // отношение нашего входа к чужому весу:
+            //     доля = buy_usd / (free_float_usd + buy_usd)
+            //
+            // Прежний гейт `max_qualified_float_usd` был абсолютом и намерения
+            // не выражал: один и тот же порог $400 означал 13% доли на входе
+            // 0.3 SOL и 43% на 1.5 SOL. Теперь порог задан прямо в процентах и
+            // сам масштабируется с размером позиции.
+            //
+            // Замер 27.10.2026 показывает, насколько это решает: на живых
+            // кандидатах проектная доля гуляла от 9.4% до 100%. Наша убыточная
+            // Fortress дала по факту 1.63% при трёх получателях.
+            let buy_usd = buy_sol * sol_price;
             if let Some(f) = float_override {
-                if f > max_float {
+                let share = if buy_usd + f > 0.0 {
+                    100.0 * buy_usd / (f + buy_usd)
+                } else {
+                    0.0
+                };
+                if share < self.cfg.strategy.min_reward_share_pct {
                     sk_float += 1;
+                    note(
+                        &mut reasons,
+                        format!("доля в выплате {share:.0}% < min (чужой флоат ${f:.0})"),
+                    );
                     continue;
                 }
+                info!(
+                    "{}: флоат ${f:.0}, вход ${buy_usd:.0} → наша доля выплаты ~{share:.0}%",
+                    c.mint
+                );
+            } else if self.cfg.strategy.require_float_measure {
+                // Флоат не измерился (RPC) — входить вслепую нельзя: именно так
+                // и берутся монеты, где чужой вес в десятки раз больше нашего.
+                sk_float += 1;
+                note(&mut reasons, "флоат не измерился".to_string());
+                continue;
             }
             match self.filters.evaluate(&c, buy_sol, sol_price, float_override) {
                 Verdict::Skip(r) => {
