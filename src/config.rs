@@ -233,6 +233,15 @@ pub struct StrategyConfig {
     /// Используется как нижняя граница: берём max(этого значения, floorSol).
     #[serde(default = "default_payout_floor_sol")]
     pub payout_floor_sol: f64,
+    /// Сколько котлов опрашивать ОДНОВРЕМЕННО в фоновом обходе.
+    /// Замер 27.10.2026 на 120 монетах: последовательно 851 мс на монету (500
+    /// монет = 426 секунд), x20 = 33 секунды, x40 = 25 секунд. Это обычный HTTP
+    /// к борде, RPC здесь не участвует.
+    #[serde(default = "default_pot_scan_concurrency")]
+    pub pot_scan_concurrency: u32,
+    /// Пауза между полными обходами котлов (сек).
+    #[serde(default = "default_pot_scan_interval_secs")]
+    pub pot_scan_interval_secs: u64,
     /// Жёсткий потолок трат на пролив за одну позицию. Исчерпали → НЕ бейлим, а
     /// падаем в дешёвый опрос (шанс поймать реворд остаётся, деньги не горят).
     #[serde(default = "default_exit_spam_max_sol")]
@@ -285,6 +294,12 @@ fn default_min_vault_fill_pct() -> f64 {
 }
 fn default_payout_floor_sol() -> f64 {
     0.10
+}
+fn default_pot_scan_concurrency() -> u32 {
+    20
+}
+fn default_pot_scan_interval_secs() -> u64 {
+    15
 }
 fn default_exit_spam_window_secs() -> u64 {
     60

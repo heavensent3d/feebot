@@ -327,6 +327,13 @@ async fn run_loops(
         });
     }
 
+    // 1б) фоновый ПАРАЛЛЕЛЬНЫЙ обход котлов: наполняет кэш, по которому тик
+    //     выбирает самый полный котёл, а не первый попавшийся.
+    {
+        let bot = Arc::clone(&bot);
+        tokio::spawn(async move { bot.pot_scan_loop().await });
+    }
+
     // 2) продажа наград раз в ~минуту
     {
         let bot = Arc::clone(&bot);

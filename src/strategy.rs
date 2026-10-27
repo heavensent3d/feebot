@@ -81,6 +81,13 @@ pub struct Bot {
     recent_trade: Arc<Mutex<HashMap<Pubkey, std::time::Instant>>>,
     /// Будилка цикла входа: шреды будят немедленный опрос борды OTC.
     poll_now: Arc<Notify>,
+    /// mint → (заполнение котла в %, когда измерено). Обновляется ФОНОВЫМ
+    /// параллельным обходом: последовательный опрос стоит 851 мс на монету, то
+    /// есть полный проход по 500 кандидатам занимал бы 426 секунд, и котлы за
+    /// это время успевают смениться. При 20 одновременных запросах тот же обход
+    /// укладывается в 33 секунды, и тик может выбирать САМЫЙ полный котёл, а не
+    /// первый попавшийся.
+    pot_cache: Arc<Mutex<HashMap<Pubkey, (f64, std::time::Instant)>>>,
 }
 
 impl Bot {
@@ -109,6 +116,7 @@ impl Bot {
             active_reward_mints: Arc::new(Mutex::new(HashSet::new())),
             sol_price: Arc::new(Mutex::new((0.0, std::time::Instant::now()))),
             exit_registry: Arc::new(Mutex::new(HashMap::new())),
+            pot_cache: Arc::new(Mutex::new(HashMap::new())),
             no_template: Arc::new(Mutex::new(HashMap::new())),
             coin_fees: Arc::new(Mutex::new(HashMap::new())),
             curve_to_mint: Arc::new(Mutex::new(HashMap::new())),
@@ -257,6 +265,67 @@ impl Bot {
             .map(|bd| bd.float_usd)
     }
 
+    /// ФОНОВЫЙ ОБХОД КОТЛОВ. Тянет борду и опрашивает `/api/vault` по всем
+    /// кандидатам ПАРАЛЛЕЛЬНО, складывая заполнение в `pot_cache`.
+    ///
+    /// Зачем отдельный цикл: заполнение котла — единственный сигнал «выплата
+    /// близко», но он живёт в per-coin запросе. Последовательно это 851 мс на
+    /// монету (замер), то есть 426 секунд на 500 кандидатов — за такой проход
+    /// котлы полностью обновляются, и вход получался по случайной монете.
+    /// При 20 одновременных запросах тот же проход занимает 33 секунды.
+    /// HTTP к борде бесплатный, RPC здесь не трогается вовсе.
+    pub async fn pot_scan_loop(self: Arc<Self>) {
+        let conc = self.cfg.strategy.pot_scan_concurrency.max(1) as usize;
+        let every = std::time::Duration::from_secs(self.cfg.strategy.pot_scan_interval_secs.max(5));
+        loop {
+            let started = std::time::Instant::now();
+            let cands = match self.oracle.candidates().await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("обход котлов: борда недоступна ({e})");
+                    tokio::time::sleep(every).await;
+                    continue;
+                }
+            };
+            let floor_cfg = self.cfg.strategy.payout_floor_sol;
+            let mut fresh: HashMap<Pubkey, (f64, std::time::Instant)> = HashMap::new();
+            let mut it = cands.into_iter();
+            let mut set: tokio::task::JoinSet<Option<(Pubkey, f64)>> = tokio::task::JoinSet::new();
+            loop {
+                // Держим ровно `conc` запросов в полёте.
+                while set.len() < conc {
+                    let Some(c) = it.next() else { break };
+                    let me = Arc::clone(&self);
+                    set.spawn(async move {
+                        let v = me.oracle.vault(&c.mint.to_string()).await.ok()?;
+                        if v.graduated {
+                            return None;
+                        }
+                        Some((c.mint, v.fill_pct(floor_cfg)))
+                    });
+                }
+                match set.join_next().await {
+                    Some(Ok(Some((mint, fill)))) => {
+                        fresh.insert(mint, (fill, std::time::Instant::now()));
+                    }
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+            let ready = fresh
+                .values()
+                .filter(|(f, _)| *f >= self.cfg.strategy.min_vault_fill_pct)
+                .count();
+            info!(
+                "обход котлов: {} монет за {:.1}с, готовых к входу {ready}",
+                fresh.len(),
+                started.elapsed().as_secs_f64()
+            );
+            *self.pot_cache.lock().await = fresh;
+            tokio::time::sleep(every).await;
+        }
+    }
+
     /// Один проход отбора: берём кандидатов, фильтруем, открываем позиции.
     pub async fn tick_entries(self: &Arc<Self>) -> Result<()> {
         // Потолок занят целиком → не дёргаем RPC впустую (при max=1 это значит
@@ -264,7 +333,23 @@ impl Bot {
         if self.slots.available_permits() == 0 {
             return Ok(());
         }
-        let cands = self.oracle.candidates().await?;
+        let mut cands = self.oracle.candidates().await?;
+        // РАНЖИРОВАНИЕ ПО КОТЛУ. Цикл ниже берёт ПЕРВОГО прошедшего кандидата,
+        // поэтому порядок списка и есть выбор позиции. Фоновый обход
+        // (pot_scan_loop) уже измерил заполнение котлов параллельно, так что
+        // здесь это стоит одного взятия мьютекса: ставим вперёд самые полные.
+        // Без него вход доставался случайной монете — котёл проверялся только
+        // у того кандидата, до которого дошла очередь.
+        {
+            let pots = self.pot_cache.lock().await;
+            if !pots.is_empty() {
+                cands.sort_by(|a, b| {
+                    let fa = pots.get(&a.mint).map(|(f, _)| *f).unwrap_or(-1.0);
+                    let fb = pots.get(&b.mint).map(|(f, _)| *f).unwrap_or(-1.0);
+                    fb.partial_cmp(&fa).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
+        }
         // Обновляем карту кривая→mint по ВСЕМ кандидатам, чтобы шред-консьюмер мог
         // по событию раунда опознать монету и копить частоту раундов.
         {
