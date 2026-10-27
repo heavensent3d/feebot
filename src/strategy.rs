@@ -889,7 +889,7 @@ const HOLDERS_CUT: f64 = 0.675;
             let ratio = 100.0 * reward_value_sol / expected_reward_sol;
             info!(
                 "СВЕРКА {}: ожидали фис {expected_reward_sol:.4} SOL, получили {reward_value_sol:.4} SOL ({ratio:.0}% от прогноза)",
-                c.symbol.as_deref().unwrap_or("?")
+                &c.symbol
             );
         }
         self.reporter.report_trade(&rep).await;
