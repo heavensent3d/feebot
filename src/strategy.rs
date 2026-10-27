@@ -434,6 +434,9 @@ impl Bot {
     async fn run_position(&self, c: Candidate) -> Result<()> {
         let mint = c.mint;
         let buy_lamports = (self.cfg.strategy.buy_sol * LAMPORTS_PER_SOL) as u64;
+        // Баланс ДО сделки — основа честного PnL: разница с балансом после
+        // закрытия включает вход, выход, все комиссии, tip и ренту ATA.
+        let lamports_before = self.rpc.lamports(&self.payer.pubkey()).await.unwrap_or(0);
 
         // Читаем bonding curve (лоукап = ещё на кривой).
         let curve_acc = self.rpc.account(&pumpfun::bonding_curve(&mint)).await?;
@@ -618,7 +621,7 @@ impl Bot {
         self.set_busy(false);
         let (closed, attempts, sell_amount) = r?;
         if closed && !self.cfg.strategy.dry_run {
-            self.emit_report(&c, &curve, &our_reward_ata, reward_baseline, sell_amount, attempts)
+            self.emit_report(&c, &our_reward_ata, reward_baseline, lamports_before, attempts)
                 .await;
         }
         Ok(())
@@ -628,14 +631,22 @@ impl Bot {
     async fn emit_report(
         &self,
         c: &Candidate,
-        curve: &pumpfun::Curve,
         reward_ata: &Pubkey,
         reward_baseline: u64,
-        sell_amount: u64,
+        lamports_before: u64,
         attempts: u64,
     ) {
         let sol_price = self.sol_price_usd().await;
-        let coin_sell_sol = curve.sol_out_for_tokens(sell_amount) as f64 / LAMPORTS_PER_SOL;
+        // ФАКТИЧЕСКАЯ дельта кошелька за сделку, а не расчёт по кривой.
+        //
+        // Раньше выручка бралась как curve.sol_out_for_tokens(sell_amount) — то
+        // есть из ФОРМУЛЫ по состоянию кривой, прочитанному ДО сделки. Это не
+        // то, что реально пришло: ни проскальзывания, ни фактической цены
+        // исполнения, ни комиссий там нет. Теперь считаем по балансу: он
+        // включает всё разом — вход, выход, комиссии, ренту ATA, tip.
+        let lamports_after = self.rpc.lamports(&self.payer.pubkey()).await.unwrap_or(lamports_before);
+        let wallet_delta_sol =
+            (lamports_after as f64 - lamports_before as f64) / LAMPORTS_PER_SOL;
 
         // Сколько стока начислил раунд (raw-единицы) и его оценка в SOL (котировка).
         let reward_now = self.rpc.token_amount(reward_ata).await.unwrap_or(reward_baseline);
@@ -658,14 +669,21 @@ impl Bot {
         let fees = Fees {
             base_lamports: 5000 * 2,
             priority_lamports: priority,
-            tips_lamports: 0,
+            // tip платится только за ПРИЗЕМЛИВШУЮСЯ tx: вход и выход.
+            tips_lamports: 5_000 * 2,
             spam_attempts: attempts,
             spam_cost_lamports: attempts.saturating_mul(5000),
             ata_rent_lamports: 2 * 2_039_280,
         };
         let buy_sol = s.buy_sol;
-        let net_sol = (coin_sell_sol - buy_sol) + reward_value_sol
-            - fees.total_nonrefundable() as f64 / LAMPORTS_PER_SOL;
+        // Дельта кошелька уже содержит вход, выход и ВСЕ комиссии. Реворд ещё не
+        // продан (его сбрасывает sell_rewards позже), поэтому добавляем его
+        // котировку — иначе каждая прибыльная сделка выглядела бы убыточной.
+        let net_sol = wallet_delta_sol + reward_value_sol;
+        // Нога по монете = дельта минус комиссии: показываем отдельно, чтобы
+        // было видно, сколько съела сама монета, а сколько комиссии.
+        let coin_sell_sol = buy_sol + wallet_delta_sol
+            + fees.total_nonrefundable() as f64 / LAMPORTS_PER_SOL;
 
         let rep = TradeReport {
             mint: c.mint.to_string(),
@@ -1182,6 +1200,7 @@ impl Bot {
         let max_tries = (budget / per_try.max(1)).max(1);
         let resign = std::time::Duration::from_secs(self.cfg.strategy.exit_resign_secs.max(5));
         let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let send_errs = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let mut fired = 0u64;
         let mut cached: Option<Vec<crate::relay::CachedTx>> = None;
         let mut signed_at = std::time::Instant::now();
@@ -1197,8 +1216,9 @@ impl Bot {
         loop {
             if fired >= max_tries {
                 warn!(
-                    "EXIT {mint}: бюджет пролива исчерпан ({fired} попыток ≈ {:.4} SOL) → в дешёвый опрос",
-                    (fired * per_try) as f64 / LAMPORTS_PER_SOL
+                    "EXIT {mint}: бюджет пролива исчерпан ({fired} попыток ≈ {:.4} SOL, отбито отправкой {}) → в дешёвый опрос",
+                    (fired * per_try) as f64 / LAMPORTS_PER_SOL,
+                    send_errs.load(std::sync::atomic::Ordering::Relaxed)
                 );
                 return (false, attempts.load(std::sync::atomic::Ordering::Relaxed), true);
             }
@@ -1243,9 +1263,18 @@ impl Bot {
             if let Some(c) = cached.clone() {
                 let relays = self.relays.clone();
                 let a = Arc::clone(&attempts);
+                let errs = Arc::clone(&send_errs);
                 fired += 1;
                 tokio::spawn(async move {
-                    let _ = relays.send_cached(&c).await;
+                    // Результат отправки НЕ глотаем: прошлый пролив ушёл в пустоту
+                    // (4638 транз, на чейн ноль), и мы об этом не знали, потому что
+                    // ошибку отбрасывали. Логируем первые несколько.
+                    if let Err(e) = relays.send_cached(&c).await {
+                        let n = errs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if n < 3 {
+                            warn!("пролив: отправка отбита ({e})");
+                        }
+                    }
                     a.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 });
             }
