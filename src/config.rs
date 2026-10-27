@@ -245,6 +245,12 @@ pub struct StrategyConfig {
     /// дала 1.63% при трёх получателях и реворд 0.0039 SOL.
     #[serde(default = "default_min_reward_share_pct")]
     pub min_reward_share_pct: f64,
+    /// Минимальный ОЖИДАЕМЫЙ фис за позицию, SOL. Считается целиком из чейна:
+    ///     pot(creator_vault) × 0.675 × наша_доля
+    /// Round-trip по монете стоит ~3% позиции (замер: 0.0092 на входе 0.3 SOL),
+    /// плюс комиссии — ниже этого входить бессмысленно.
+    #[serde(default = "default_min_expected_reward_sol")]
+    pub min_expected_reward_sol: f64,
     /// Входить ли, когда флоат ИЗМЕРИТЬ НЕ УДАЛОСЬ (ошибка RPC).
     /// true = не входить. Вслепую берутся ровно те монеты, где чужой вес в
     /// десятки раз больше нашего, а узнать это постфактум уже нечем.
@@ -314,6 +320,9 @@ fn default_payout_floor_sol() -> f64 {
 }
 fn default_min_reward_share_pct() -> f64 {
     50.0
+}
+fn default_min_expected_reward_sol() -> f64 {
+    0.05
 }
 fn default_require_float_measure() -> bool {
     true

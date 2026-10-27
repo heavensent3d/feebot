@@ -34,6 +34,10 @@ pub struct Candidate {
     pub distributed_sol: Option<f64>,
     /// Сколько холдеров делили последнюю выплату — прокси флоата (меньше = наша доля больше).
     pub last_paid_holders: Option<u64>,
+    /// Наша ДОЛЯ в будущей выплате (0..1), измеренная в tick_entries перед
+    /// входом: buy_usd / (чужой свободный флоат + buy_usd). Нужна в позиции,
+    /// чтобы посчитать ожидаемый фис из чейна.
+    pub share_frac: Option<f64>,
     /// Сколько секунд назад была ПОСЛЕДНЯЯ раздача. Критично: монета с отличной
     /// историей, но раздававшая 17 часов назад — мёртвая, раунда за наш холд не будет.
     pub last_payout_age_secs: Option<u64>,
@@ -149,6 +153,7 @@ impl Oracle {
                 owed_sol: c.rewards.as_ref().map(|r| r.owed as f64 / 1e9),
                 distributed_sol: c.rewards.as_ref().map(|r| r.distributed as f64 / 1e9),
                 last_paid_holders: c.rewards.as_ref().map(|r| r.last_paid_holders),
+                share_frac: None,
                 last_payout_age_secs: None,
             });
         }

@@ -128,6 +128,10 @@ impl Bot {
 
     /// Кулдаун для монеты без найденного buy-шаблона (сек).
     const NO_TEMPLATE_COOLDOWN_SECS: u64 = 180;
+/// Доля пота, уходящая ХОЛДЕРАМ. Остальное расписано в интерфейсе монеты:
+/// протокол 12.5%, desk pot 10%, выкупы OTC 10%. Проверено на STOCKS, где
+/// distributed/earned сошлось с этой долей до копейки.
+const HOLDERS_CUT: f64 = 0.675;
 
     /// Будилка цикла входа (её дёргает шред-консьюмер).
     pub fn poll_now(&self) -> Arc<Notify> {
@@ -470,6 +474,7 @@ impl Bot {
                     );
                     continue;
                 }
+                c.share_frac = Some(share / 100.0);
                 info!(
                     "{}: флоат ${f:.0}, вход ${buy_usd:.0} → наша доля выплаты ~{share:.0}%",
                     c.mint
@@ -643,15 +648,46 @@ impl Bot {
                 // дожидаясь, пока он проявится в их API, — а раннее знание и
                 // есть тот запас, на котором заходят за минуту до раздачи.
                 // Логируем обе величины рядом, чтобы сверить формулу на фактах.
-                {
+                // КОТЁЛ СЧИТАЕМ ИЗ ЧЕЙНА, а не берём с витрины OTC.
+                //
+                // Фисы создателя pump копятся на PDA `creator-vault`, и именно их
+                // воркер OTC клеймит и раздаёт холдерам. Сверка на живой монете
+                // 27.10.2026: API 0.154390 SOL против 0.155281 на чейне — чейн
+                // ВПЕРЕДИ на 0.00089. Их API догоняет, а мы можем знать пот
+                // раньше и опрашивать его так часто, как позволяет RPC.
+                //
+                // Отсюда ожидаемый фис считается целиком из чейна:
+                //     reward = pot × HOLDERS_CUT × наша_доля
+                // где HOLDERS_CUT = 0.675 (остальное: протокол 12.5%, desk pot
+                // 10%, выкупы 10% — подписано в самом интерфейсе монеты).
+                let pot_sol = {
                     let vault_pda = pumpfun::creator_vault(&creator);
                     let onchain = self.rpc.lamports(&vault_pda).await.unwrap_or(0) as f64
                         / LAMPORTS_PER_SOL;
+                    if onchain > 0.0 {
+                        info!(
+                            "{mint}: котёл из чейна {onchain:.6} SOL (API показывал {:.6}, отставание {:+.6})",
+                            v.waiting_sol,
+                            onchain - v.waiting_sol
+                        );
+                        onchain
+                    } else {
+                        v.waiting_sol
+                    }
+                };
+                let share_frac = c.share_frac.unwrap_or(1.0);
+                let expected_reward = pot_sol * HOLDERS_CUT * share_frac;
+                info!(
+                    "{mint}: ОЖИДАЕМЫЙ ФИС {expected_reward:.4} SOL (пот {pot_sol:.4} × {:.1}% холдерам × наша доля {:.0}%)",
+                    HOLDERS_CUT * 100.0,
+                    share_frac * 100.0
+                );
+                if expected_reward < self.cfg.strategy.min_expected_reward_sol {
                     info!(
-                        "{mint}: котёл API {:.6} SOL | creator_vault в чейне {onchain:.6} SOL | разница {:+.6}",
-                        v.waiting_sol,
-                        onchain - v.waiting_sol
+                        "{mint}: ожидаемый фис {expected_reward:.4} < min {:.4} SOL — не окупит round-trip, скип",
+                        self.cfg.strategy.min_expected_reward_sol
                     );
+                    return Ok(());
                 }
                 info!("{mint}: котёл заполнен {fill:.1}% ({:.4}/{floor:.4} SOL) — раунд близко, входим",
                       v.waiting_sol);
