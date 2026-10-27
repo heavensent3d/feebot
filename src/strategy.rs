@@ -657,8 +657,8 @@ const HOLDERS_CUT: f64 = 0.675;
                 // раньше и опрашивать его так часто, как позволяет RPC.
                 //
                 // Отсюда ожидаемый фис считается целиком из чейна:
-                //     reward = pot × HOLDERS_CUT × наша_доля
-                // где HOLDERS_CUT = 0.675 (остальное: протокол 12.5%, desk pot
+                //     reward = pot × Self::HOLDERS_CUT × наша_доля
+                // где Self::HOLDERS_CUT = 0.675 (остальное: протокол 12.5%, desk pot
                 // 10%, выкупы 10% — подписано в самом интерфейсе монеты).
                 let pot_sol = {
                     let vault_pda = pumpfun::creator_vault(&creator);
@@ -676,10 +676,10 @@ const HOLDERS_CUT: f64 = 0.675;
                     }
                 };
                 let share_frac = c.share_frac.unwrap_or(1.0);
-                let expected_reward = pot_sol * HOLDERS_CUT * share_frac;
+                let expected_reward = pot_sol * Self::HOLDERS_CUT * share_frac;
                 info!(
                     "{mint}: ОЖИДАЕМЫЙ ФИС {expected_reward:.4} SOL (пот {pot_sol:.4} × {:.1}% холдерам × наша доля {:.0}%)",
-                    HOLDERS_CUT * 100.0,
+                    Self::HOLDERS_CUT * 100.0,
                     share_frac * 100.0
                 );
                 if expected_reward < self.cfg.strategy.min_expected_reward_sol {
