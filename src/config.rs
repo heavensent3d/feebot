@@ -251,6 +251,15 @@ pub struct StrategyConfig {
     /// плюс комиссии — ниже этого входить бессмысленно.
     #[serde(default = "default_min_expected_reward_sol")]
     pub min_expected_reward_sol: f64,
+    /// Границы ПОДБОРА размера позиции. Размер не фиксирован: он считается из
+    /// пота и чужого флоата как buy_opt = sqrt(pot × 0.675 × float / cost) − float,
+    /// то есть точка максимума net(buy). Разобранный бот держит 1-2 SOL и
+    /// подбирает «в зависимости от доли и холдеров» — формула даёт тот же
+    /// диапазон.
+    #[serde(default = "default_min_buy_sol")]
+    pub min_buy_sol: f64,
+    #[serde(default = "default_max_buy_sol")]
+    pub max_buy_sol: f64,
     /// Входить ли, когда флоат ИЗМЕРИТЬ НЕ УДАЛОСЬ (ошибка RPC).
     /// true = не входить. Вслепую берутся ровно те монеты, где чужой вес в
     /// десятки раз больше нашего, а узнать это постфактум уже нечем.
@@ -337,6 +346,12 @@ fn default_min_reward_share_pct() -> f64 {
 }
 fn default_min_expected_reward_sol() -> f64 {
     0.05
+}
+fn default_min_buy_sol() -> f64 {
+    0.3
+}
+fn default_max_buy_sol() -> f64 {
+    2.0
 }
 fn default_require_float_measure() -> bool {
     true

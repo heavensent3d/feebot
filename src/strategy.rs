@@ -133,6 +133,10 @@ impl Bot {
 /// протокол 12.5%, desk pot 10%, выкупы OTC 10%. Проверено на STOCKS, где
 /// distributed/earned сошлось с этой долей до копейки.
 const HOLDERS_CUT: f64 = 0.675;
+/// Фактическая цена round-trip по монете, доля от позиции. Замер по 17 живым
+/// сделкам: средняя −4.7%, минимальная −2.6% (две комиссии pump по 1% плюс
+/// спред). Берём минимальную как базу для подбора размера.
+const ROUND_TRIP_COST: f64 = 0.026;
 
     /// Будилка цикла входа (её дёргает шред-консьюмер).
     pub fn poll_now(&self) -> Arc<Notify> {
@@ -498,6 +502,7 @@ const HOLDERS_CUT: f64 = 0.675;
                     continue;
                 }
                 c.share_frac = Some(share / 100.0);
+                c.float_usd = Some(f);
                 info!(
                     "{}: флоат ${f:.0}, вход ${buy_usd:.0} → наша доля выплаты ~{share:.0}%",
                     c.mint
@@ -578,7 +583,8 @@ const HOLDERS_CUT: f64 = 0.675;
     /// Полный цикл одной позиции: вход → спам-выход.
     async fn run_position(&self, c: Candidate) -> Result<()> {
         let mint = c.mint;
-        let buy_lamports = (self.cfg.strategy.buy_sol * LAMPORTS_PER_SOL) as u64;
+        // Размер подбирается ниже, когда станут известны пот и чужой флоат.
+        let mut buy_lamports = (self.cfg.strategy.buy_sol * LAMPORTS_PER_SOL) as u64;
         // Баланс ДО сделки — основа честного PnL: разница с балансом после
         // закрытия включает вход, выход, все комиссии, tip и ренту ATA.
         let lamports_before = self.rpc.lamports(&self.payer.pubkey()).await.unwrap_or(0);
@@ -702,7 +708,33 @@ const HOLDERS_CUT: f64 = 0.675;
                         v.waiting_sol
                     }
                 };
-                let share_frac = c.share_frac.unwrap_or(1.0);
+                // ПОДБОР РАЗМЕРА ПОЗИЦИИ. Разобранный бот держит 1-2 SOL и, по
+                // его словам, «сам подбирает в зависимости от доли и холдеров».
+                // Это решается в одну строку: прибыль от позиции есть
+                //     net(buy) = pot × 0.675 × buy/(float+buy) − cost × buy
+                // где первое слагаемое насыщается, а второе растёт линейно.
+                // Максимум там, где производная ноль:
+                //     buy_opt = sqrt(pot × 0.675 × float / cost) − float
+                // На наших числах это даёт как раз 1-2 SOL и всегда
+                // положительный net — проверено таблицей по сетке pot/float.
+                let float_sol = c.float_usd.unwrap_or(0.0) / sol_price.max(1e-9);
+                let raw_opt = (pot_sol * Self::HOLDERS_CUT * float_sol / Self::ROUND_TRIP_COST)
+                    .max(0.0)
+                    .sqrt()
+                    - float_sol;
+                let buy_sol_dyn = raw_opt
+                    .max(self.cfg.strategy.min_buy_sol)
+                    .min(self.cfg.strategy.max_buy_sol);
+                let share_frac = if float_sol + buy_sol_dyn > 0.0 {
+                    buy_sol_dyn / (float_sol + buy_sol_dyn)
+                } else {
+                    1.0
+                };
+                buy_lamports = (buy_sol_dyn * LAMPORTS_PER_SOL) as u64;
+                info!(
+                    "{mint}: РАЗМЕР подобран {buy_sol_dyn:.3} SOL (пот {pot_sol:.4}, чужой флоат {float_sol:.4} SOL) → доля {:.0}%",
+                    share_frac * 100.0
+                );
                 let expected_reward = pot_sol * Self::HOLDERS_CUT * share_frac;
                 expected_reward_sol = expected_reward;
                 info!(
