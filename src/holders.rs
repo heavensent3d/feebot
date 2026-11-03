@@ -215,3 +215,99 @@ pub fn excluded_accounts(mint: &Pubkey, creator: &Pubkey) -> Vec<Pubkey> {
         crate::pumpfun::ata_2022(&vault, mint),
     ]
 }
+
+/// Флоат, который РЕАЛЬНО конкурирует за ближайшую раздачу: только держатели,
+/// у которых УЖЕ ОТКРЫТ ATA под reward-актив.
+///
+/// Проверено на чейне 03.11.2026: раздача НЕ создаёт ATA получателям. Три
+/// подряд раздачи — 12 получателей, все 12 уже имели ATA до транзакции,
+/// инструкций создания ноль, только переводы Tokenkeg. Кто не открыл заранее —
+/// не получает ничего, и значит в знаменателе нашей доли ему не место.
+///
+/// Это меняет расчёт радикально: обычный флоат считает ВСЕХ держателей монеты,
+/// а платят лишь подмножеству. Мы завышали знаменатель и занижали свою долю.
+///
+/// Стоит трёх RPC-вызовов: топ-аккаунты монеты, их владельцы, существование их
+/// reward-ATA.
+pub async fn eligible_float_usd(
+    rpc: &crate::rpc::Rpc,
+    mint: &Pubkey,
+    reward_mint: &Pubkey,
+    reward_token_program: &Pubkey,
+    usd_price_per_token: f64,
+    min_holding_usd: f64,
+    exclude: &[Pubkey],
+) -> Result<FloatBreakdown> {
+    let largest = rpc
+        .client
+        .get_token_largest_accounts(mint)
+        .await
+        .map_err(|e| anyhow!("get_token_largest_accounts {mint}: {e}"))?;
+
+    // Адрес токен-аккаунта → сколько на нём монеты.
+    let mut accs: Vec<(Pubkey, f64)> = Vec::new();
+    for b in largest {
+        let addr = Pubkey::from_str(&b.address)
+            .map_err(|e| anyhow!("плохой адрес токен-аккаунта {}: {e}", b.address))?;
+        if exclude.contains(&addr) {
+            continue;
+        }
+        let ui = b.amount.ui_amount.unwrap_or(0.0);
+        if ui > 0.0 {
+            accs.push((addr, ui));
+        }
+    }
+    if accs.is_empty() {
+        return Ok(FloatBreakdown { float_usd: 0.0, eligible_holders: 0, total_accounts: 0 });
+    }
+
+    // Владельцы этих токен-аккаунтов.
+    let keys: Vec<String> = accs.iter().map(|(a, _)| a.to_string()).collect();
+    let info = rpc
+        .raw("getMultipleAccounts", serde_json::json!([keys, {"encoding":"jsonParsed"}]))
+        .await?;
+    let vals = info["value"].as_array().cloned().unwrap_or_default();
+
+    let mut owners: Vec<(Pubkey, f64)> = Vec::new();
+    for ((_, ui), v) in accs.iter().zip(vals.iter()) {
+        let owner = v["data"]["parsed"]["info"]["owner"].as_str().unwrap_or("");
+        if let Ok(o) = Pubkey::from_str(owner) {
+            owners.push((o, *ui));
+        }
+    }
+    if owners.is_empty() {
+        return Ok(FloatBreakdown { float_usd: 0.0, eligible_holders: 0, total_accounts: 0 });
+    }
+
+    // Есть ли у владельца ATA под reward-актив.
+    let atas: Vec<String> = owners
+        .iter()
+        .map(|(o, _)| {
+            spl_associated_token_account::get_associated_token_address_with_program_id(
+                o,
+                reward_mint,
+                reward_token_program,
+            )
+            .to_string()
+        })
+        .collect();
+    let ex = rpc
+        .raw("getMultipleAccounts", serde_json::json!([atas, {"encoding":"base64"}]))
+        .await?;
+    let exv = ex["value"].as_array().cloned().unwrap_or_default();
+
+    let mut float_usd = 0.0f64;
+    let mut eligible = 0usize;
+    for ((_, ui), v) in owners.iter().zip(exv.iter()) {
+        if v.is_null() {
+            continue; // ATA нет → в раздаче не участвует
+        }
+        let usd = ui * usd_price_per_token;
+        if usd >= min_holding_usd {
+            float_usd += usd;
+            eligible += 1;
+        }
+    }
+    tracing::debug!(mint=%mint, float_usd, eligible, total=owners.len(), "eligible_float_usd");
+    Ok(FloatBreakdown { float_usd, eligible_holders: eligible, total_accounts: owners.len() })
+}

@@ -268,6 +268,29 @@ const ROUND_TRIP_COST: f64 = 0.026;
             / (curve.virtual_token_reserves as f64 / 1e6).max(1e-9);
         let price_usd = price_sol * sol_price;
         let exclude = crate::holders::excluded_accounts(&c.mint, &curve.creator);
+        // КОНКУРИРУЮТ ЗА РАЗДАЧУ НЕ ВСЕ ДЕРЖАТЕЛИ, а только те, у кого уже
+        // открыт ATA под reward-актив: раздача ATA не создаёт (проверено на
+        // трёх раздачах — 12 получателей, все 12 с готовым ATA, ноль созданий).
+        // Обычный флоат считал всех подряд и тем завышал знаменатель нашей доли.
+        let reward_tp = pumpfun::coin_token_program(&self.rpc, &c.reward_mint).await;
+        if let Ok(bd) = crate::holders::eligible_float_usd(
+            &self.rpc,
+            &c.mint,
+            &c.reward_mint,
+            &reward_tp,
+            price_usd,
+            20.0,
+            &exclude,
+        )
+        .await
+        {
+            info!(
+                "{}: конкурентов с открытым ATA {} из {} держателей, их флоат ${:.0}",
+                c.mint, bd.eligible_holders, bd.total_accounts, bd.float_usd
+            );
+            return Some(bd.float_usd);
+        }
+        // Запасной путь — прежний подсчёт по всем держателям.
         crate::holders::qualified_float_usd(&self.rpc, &c.mint, price_usd, 20.0, &exclude)
             .await
             .ok()
