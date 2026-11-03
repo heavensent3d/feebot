@@ -717,7 +717,8 @@ const ROUND_TRIP_COST: f64 = 0.026;
                 //     buy_opt = sqrt(pot × 0.675 × float / cost) − float
                 // На наших числах это даёт как раз 1-2 SOL и всегда
                 // положительный net — проверено таблицей по сетке pot/float.
-                let float_sol = c.float_usd.unwrap_or(0.0) / sol_price.max(1e-9);
+                let sol_usd = self.sol_price_usd().await;
+                let float_sol = c.float_usd.unwrap_or(0.0) / sol_usd.max(1e-9);
                 let raw_opt = (pot_sol * Self::HOLDERS_CUT * float_sol / Self::ROUND_TRIP_COST)
                     .max(0.0)
                     .sqrt()
