@@ -41,6 +41,12 @@ pub struct Candidate {
     /// Чужой свободный флоат в USD, измеренный перед входом. Нужен в позиции,
     /// чтобы ПОДОБРАТЬ размер: доля зависит от того, сколько мы покупаем.
     pub float_usd: Option<f64>,
+    /// ВСЯ линейка reward-активов монеты. Раздача НЕ создаёт ATA получателям
+    /// (проверено на трёх раздачах: 12 получателей, 12 уже имели ATA, ноль
+    /// инструкций создания), а линейка ротируется после каждой выплаты. Значит
+    /// ATA надо держать открытыми под ВСЕ активы, иначе можно не попасть в
+    /// собственную раздачу.
+    pub reward_basket: Vec<Pubkey>,
     /// Сколько секунд назад была ПОСЛЕДНЯЯ раздача. Критично: монета с отличной
     /// историей, но раздававшая 17 часов назад — мёртвая, раунда за наш холд не будет.
     pub last_payout_age_secs: Option<u64>,
@@ -158,6 +164,11 @@ impl Oracle {
                 last_paid_holders: c.rewards.as_ref().map(|r| r.last_paid_holders),
                 share_frac: None,
                 float_usd: None,
+                reward_basket: c
+                    .reward_basket
+                    .as_ref()
+                    .map(|b| b.iter().filter_map(|x| Pubkey::from_str(x).ok()).collect())
+                    .unwrap_or_default(),
                 last_payout_age_secs: None,
             });
         }

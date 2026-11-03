@@ -274,6 +274,53 @@ const ROUND_TRIP_COST: f64 = 0.026;
             .map(|bd| bd.float_usd)
     }
 
+    /// Открыть ATA под ВСЕ активы линейки реворда, которых у нас ещё нет.
+    ///
+    /// Раздача НЕ создаёт ATA получателям — проверено на трёх подряд раздачах:
+    /// 12 получателей, все 12 уже имели ATA до транзакции, инструкций создания
+    /// ноль, только переводы Tokenkeg. Кто не открыл заранее — не получает
+    /// ничего. А линейка активов ротируется после каждой выплаты (в интерфейсе
+    /// это «REWARD LINEUP» с пометкой PAYING NOW), поэтому держать ATA только
+    /// под текущий актив недостаточно: заплатить могут следующим.
+    ///
+    /// Отдельной транзакцией, а не внутри покупки: семь созданий ATA плюс buy
+    /// на 18 аккаунтов упираются в лимит аккаунтов транзакции.
+    async fn ensure_basket_atas(&self, basket: &[Pubkey]) -> usize {
+        let me = self.payer.pubkey();
+        let mut ixs: Vec<Instruction> = Vec::new();
+        for m in basket.iter().take(8) {
+            let tp = pumpfun::coin_token_program(&self.rpc, m).await;
+            let ata = pumpfun::ata_with(&me, m, &tp);
+            if matches!(self.rpc.account(&ata).await, Ok(Some(_))) {
+                continue; // уже есть
+            }
+            ixs.push(
+                spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                    &me, &me, m, &tp,
+                ),
+            );
+        }
+        if ixs.is_empty() {
+            return 0;
+        }
+        let n = ixs.len();
+        if self.cfg.strategy.dry_run {
+            info!("[DRY] открыл бы {n} ATA под линейку реворда");
+            return n;
+        }
+        let mut all: Vec<Instruction> =
+            compute_budget(200_000, self.cfg.strategy.sell_cu_price).to_vec();
+        all.extend(ixs);
+        match self.rpc.latest_blockhash().await {
+            Ok(bh) => match self.relays.broadcast_build(&self.payer, &all, bh, &no_alts(), &[]).await {
+                Ok(sig) => info!("открыто {n} ATA под линейку реворда: {sig}"),
+                Err(e) => warn!("не открыть ATA линейки ({e}) — можем не попасть в раздачу"),
+            },
+            Err(e) => warn!("нет blockhash для ATA линейки: {e}"),
+        }
+        n
+    }
+
     /// ФОНОВЫЙ ОБХОД КОТЛОВ. Тянет борду и опрашивает `/api/vault` по всем
     /// кандидатам ПАРАЛЛЕЛЬНО, складывая заполнение в `pot_cache`.
     ///
@@ -787,6 +834,12 @@ const ROUND_TRIP_COST: f64 = 0.026;
                 }
             },
         };
+        // ATA под ВСЮ линейку реворда — до покупки. Раздача их не создаёт, а
+        // платить могут следующим активом в ротации.
+        if !c.reward_basket.is_empty() {
+            self.ensure_basket_atas(&c.reward_basket).await;
+        }
+
         // ATA мемкоина и ATA reward-стока — КАЖДЫЙ под своей token-программой.
         let coin_ata_ix = spl_associated_token_account::instruction::create_associated_token_account_idempotent(
             &me, &me, &mint, &coin_tp,
