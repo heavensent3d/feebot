@@ -851,6 +851,132 @@ const ROUND_TRIP_COST: f64 = 0.026;
         dropped
     }
 
+    /// ОСНОВНОЙ ЦИКЛ ОТБОРА: свежие страницы борды, часто.
+    ///
+    /// Заменяет полный обход борды как источник кандидатов. Почему — замер
+    /// 04.11.2026 по 333 входам прибыльного бота danek:
+    ///   • медианный возраст монеты на входе 5 минут (25% — 3, 75% — 8);
+    ///   • капа $2.6-2.9k, то есть дно кривой; холдеров 1-9;
+    ///   • котёл на входе медианой 0.0071 SOL, у 53% входов он ВООБЩЕ ПУСТ.
+    /// То есть он не ищет жирный котёл — он приходит к наполнению первым и
+    /// ждёт выплаты, пока монету торгуют. Ранжирование по текущему котлу (наш
+    /// прежний обход) даёт ровно обратное: старые мёртвые монеты, чей котёл
+    /// накопился и не выплачивается. Лучший котёл всей борды был 0.0400 SOL,
+    /// а на свежих страницах прямо в тот же момент — 0.1696 SOL.
+    pub async fn fresh_loop(self: Arc<Self>) {
+        let every = std::time::Duration::from_secs(self.cfg.strategy.fresh_poll_secs.max(3));
+        loop {
+            let t0 = std::time::Instant::now();
+            match self.sweep_fresh().await {
+                Ok((seen, kept, best)) => {
+                    self.pause_note(
+                        "fresh",
+                        &format!(
+                            "свежие: {seen} монет за {:.1}с, в работе {kept}, лучший котёл {best:.4} SOL",
+                            t0.elapsed().as_secs_f64()
+                        ),
+                    )
+                    .await;
+                }
+                Err(e) => warn!("свежие страницы: {e:#}"),
+            }
+            tokio::time::sleep(every).await;
+        }
+    }
+
+    /// Один проход по свежим страницам: кривые -> котлы -> вотчлист с приростом.
+    pub async fn sweep_fresh(&self) -> Result<(usize, usize, f64)> {
+        let rent = self.vault_rent().await;
+        let cands = self
+            .oracle
+            .candidates_fresh(self.cfg.strategy.fresh_pages, 60)
+            .await?;
+        let seen = cands.len();
+
+        // Возраст — главный фильтр, и он бесплатный: отсекаем до всякого RPC.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let max_age = self.cfg.strategy.max_coin_age_secs as i64;
+        let cands: Vec<Candidate> = cands
+            .into_iter()
+            .filter(|c| match (max_age, c.created_at) {
+                (0, _) => true,
+                (_, Some(t)) => now - t <= max_age,
+                (_, None) => false,
+            })
+            .collect();
+
+        // Кривые батчами: creator + отсев выпустившихся.
+        let mut creator_of: HashMap<Pubkey, Pubkey> = HashMap::new();
+        let mut alive: Vec<Candidate> = Vec::with_capacity(cands.len());
+        for chunk in cands.chunks(100) {
+            let keys: Vec<String> = chunk
+                .iter()
+                .map(|c| pumpfun::bonding_curve(&c.mint).to_string())
+                .collect();
+            let Ok(v) = self
+                .rpc
+                .raw("getMultipleAccounts", serde_json::json!([keys, {"encoding":"base64"}]))
+                .await
+            else {
+                continue;
+            };
+            let vals = v["value"].as_array().cloned().unwrap_or_default();
+            for (c, item) in chunk.iter().zip(vals.iter()) {
+                let Some(b64) = item["data"][0].as_str() else { continue };
+                let Ok(raw) = B64.decode(b64) else { continue };
+                let Ok(cv) = pumpfun::parse_curve(&raw) else { continue };
+                if cv.complete {
+                    continue;
+                }
+                creator_of.insert(c.mint, cv.creator);
+                alive.push(c.clone());
+            }
+        }
+        let pots = self.read_pots(&creator_of, rent).await;
+
+        // Прирост котла считаем относительно прошлого прохода: именно он, а не
+        // сам котёл, говорит, что монету торгуют и выплата придёт за наш холд.
+        let now_i = std::time::Instant::now();
+        let prev: HashMap<Pubkey, (f64, f64, std::time::Instant)> =
+            { self.pot_cache.lock().await.clone() };
+        let mut watch: HashMap<Pubkey, Pubkey> = HashMap::new();
+        let mut fresh_pots: HashMap<Pubkey, (f64, f64, std::time::Instant)> = HashMap::new();
+        let mut ranked: Vec<(f64, Candidate)> = Vec::with_capacity(alive.len());
+        for c in alive {
+            let Some(cr) = creator_of.get(&c.mint) else { continue };
+            let pot = pots.get(cr).copied().unwrap_or(0.0);
+            let growth = match prev.get(&c.mint) {
+                Some((p0, _, t0)) => {
+                    let mins = now_i.duration_since(*t0).as_secs_f64() / 60.0;
+                    if mins > 0.01 {
+                        ((pot - p0) / mins).max(0.0)
+                    } else {
+                        0.0
+                    }
+                }
+                None => 0.0,
+            };
+            watch.insert(c.mint, *cr);
+            fresh_pots.insert(c.mint, (pot, growth, now_i));
+            ranked.push((pot + growth, c));
+        }
+        ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        if self.cfg.strategy.exclude_hooked_coins {
+            let want = ranked.len();
+            self.drop_hooked(&mut ranked, want).await;
+        }
+        let best = ranked.first().map(|(p, _)| *p).unwrap_or(0.0);
+        let kept = ranked.len();
+        let board: Vec<Candidate> = ranked.into_iter().map(|(_, c)| c).collect();
+        *self.board.lock().await = board;
+        *self.watch_creators.lock().await = watch;
+        *self.pot_cache.lock().await = fresh_pots;
+        Ok((seen, kept, best))
+    }
+
     pub async fn sweep_board(&self) -> Result<(usize, usize, f64)> {
         let rent = self.vault_rent().await;
         let cands = self
@@ -1472,9 +1598,25 @@ const ROUND_TRIP_COST: f64 = 0.026;
             1.0
         };
         buy_lamports = (buy_sol_dyn * LAMPORTS_PER_SOL) as u64;
-        // Ожидаемый фис из чейна. Храним до закрытия, чтобы сверить прогноз с
-        // фактом — без этого сверка собирается глазами по разным строкам лога.
-        let expected_reward_sol = pot_sol * Self::HOLDERS_CUT * share_frac;
+        // ОЖИДАЕМЫЙ ФИС СЧИТАЕМ НА МОМЕНТ ВЫПЛАТЫ, А НЕ НА МОМЕНТ ВХОДА.
+        //
+        // Гейт «котёл уже жирный» отбирал мёртвые монеты: у живой свежей котёл
+        // на входе почти пуст и наполняется, пока мы держим. Разбор 333 входов
+        // danek: медианный котёл на входе 0.0071 SOL, у 53% входов он ВООБЩЕ
+        // ПУСТ, и деньги он всё равно делает — потому что приходит к
+        // наполнению первым. Поэтому к текущему котлу добавляем то, что
+        // набежит за холд по измеренному приросту (SOL/мин из sweep_fresh).
+        let pot_growth = {
+            self.pot_cache
+                .lock()
+                .await
+                .get(&mint)
+                .map(|(_, g, _)| *g)
+                .unwrap_or(0.0)
+        };
+        let hold_min = self.cfg.strategy.hold_max_secs as f64 / 60.0;
+        let pot_at_payout = pot_sol + pot_growth * hold_min;
+        let expected_reward_sol = pot_at_payout * Self::HOLDERS_CUT * share_frac;
 
         // ЦЕНА КРУГА. 2.6% от позиции — замер по 17 живым round-trip (две
         // комиссии pump по 1% плюс спред; средняя там −4.7%, берём лучшую как
@@ -1509,7 +1651,7 @@ const ROUND_TRIP_COST: f64 = 0.026;
         };
         info!(
             "{mint}: РАЗМЕР {buy_sol_dyn:.3} SOL, чужой флоат {float_sol:.4} SOL → доля {:.0}%; \
-             ФИС ожидаем {expected_reward_sol:.4} SOL (пот {pot_sol:.4} × {:.1}% холдерам × доля); \
+             ФИС ожидаем {expected_reward_sol:.4} SOL (котёл {pot_sol:.4} + прирост {pot_growth:.4}/мин × {hold_min:.1}мин = {pot_at_payout:.4}, × {:.1}% холдерам × доля); \
              круг стоит {round_trip:.4} SOL → EV ×{ev_ratio:.2}",
             share_frac * 100.0,
             Self::HOLDERS_CUT * 100.0

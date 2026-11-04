@@ -412,7 +412,7 @@ async fn run_loops(
     //     67 тысячам записей.
     {
         let bot = Arc::clone(&bot);
-        tokio::spawn(async move { bot.board_sweep_loop().await });
+        tokio::spawn(async move { bot.fresh_loop().await });
     }
     // Быстрый перечёт котлов вотчлиста — он и даёт тайминг входа: полный обход
     // борды идёт минуты, а клеймят раз в 4-5 минут.

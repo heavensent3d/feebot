@@ -55,6 +55,12 @@ pub struct OtcCoin {
     #[serde(default, alias = "hook")]
     pub hook: Option<String>,
 
+    /// Unix-время создания монеты. ГЛАВНЫЙ признак отбора: разбор 333 входов
+    /// danek показал медианный возраст монеты на входе **5 минут**
+    /// (25% — 3 мин, 75% — 8 мин). Фисы собираются на запуске, а не потом.
+    #[serde(default, alias = "createdAt", alias = "created_at")]
+    pub created_at: Option<i64>,
+
     /// Накопленная доля держателей в SOL (в /api/coins НЕ приходит — оставлено
     /// на случай, если появится в другом эндпоинте).
     #[serde(

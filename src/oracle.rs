@@ -50,6 +50,8 @@ pub struct Candidate {
     /// Сколько секунд назад была ПОСЛЕДНЯЯ раздача. Критично: монета с отличной
     /// историей, но раздававшая 17 часов назад — мёртвая, раунда за наш холд не будет.
     pub last_payout_age_secs: Option<u64>,
+    /// Unix-время создания монеты (из борды). Возраст = главный фильтр.
+    pub created_at: Option<i64>,
 }
 
 pub struct Oracle {
@@ -150,6 +152,23 @@ impl Oracle {
     /// рассыпаны по всем 67 тысячам записей (замер 04.11.2026: котёл ≥0.05 SOL
     /// у пяти монет из 67 714). Порядок здесь НЕ назначается — котлы считает и
     /// ранжирует `Bot::sweep_board` уже из чейна.
+    /// СВЕЖИЕ МОНЕТЫ — первые страницы борды в ЕЁ ДЕФОЛТНОМ порядке.
+    ///
+    /// Это и есть пруд, в котором работает прибыльный бот. Замер 04.11.2026:
+    /// страница без `sort` отдаёт монеты возрастом **5-8 минут** с медианной
+    /// капой **$2689**, тогда как `sort=volume24h` — монеты медианным
+    /// возрастом **937 минут**. Разбор 333 входов danek: медианный возраст
+    /// монеты на входе 5 минут, капа $2.6-2.9k, холдеров 1-9.
+    ///
+    /// Сортировать борду по котлу нельзя (API принимает только volume24h и
+    /// marketCap), а полный обход занимает ~6 минут — за это время котёл
+    /// свежей монеты успевает наполниться И быть выплаченным. Поэтому
+    /// кандидатов берём отсюда, а котлы меряем сами и часто.
+    pub async fn candidates_fresh(&self, pages: usize, size: usize) -> Result<Vec<Candidate>> {
+        let coins = self.otc.coins_sorted(pages.max(1), size.clamp(1, 60), "fresh").await?;
+        Ok(self.map_coins(coins))
+    }
+
     pub async fn candidates_all(&self, size: usize, conc: usize) -> Result<Vec<Candidate>> {
         let coins = self.otc.coins_all(size, conc).await?;
         Ok(self.map_coins(coins))
@@ -183,11 +202,13 @@ impl Oracle {
                     &reward_mint,
                     &TOKEN_2022_PROGRAM,
                 );
+            let created_at = c.created_at;
             let pair_mint = c.pair_mint.as_deref().and_then(|s| Pubkey::from_str(s).ok());
             let snap = c.snapshot.unwrap_or_default();
 
             out.push(Candidate {
                 mint,
+                created_at,
                 symbol: c.symbol.unwrap_or_default(),
                 reward_mint,
                 reward_token_account,
