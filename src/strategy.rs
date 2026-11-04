@@ -372,8 +372,13 @@ const ROUND_TRIP_COST: f64 = 0.026;
                         .await
                     {
                         Ok(st) => info!(
-                            "ПУЛ ATA: открыто {}/{} активов (создано за проход {}), рента {:.3} SOL, покрытие борды {:.1}%",
-                            st.open, st.target, st.created, st.rent_locked_sol, st.coverage_pct
+                            "ПУЛ ATA{}: ведём {} активов, реально открыто {} (за проход {}), рента {:.3} SOL, покрытие борды {:.1}%",
+                            if self.cfg.strategy.dry_run { " [DRY]" } else { "" },
+                            st.target,
+                            st.open,
+                            st.created,
+                            st.rent_locked_sol,
+                            st.coverage_pct
                         ),
                         Err(e) => warn!("прогрев ATA: {e:#}"),
                     }

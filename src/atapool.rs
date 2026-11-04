@@ -351,8 +351,19 @@ impl AtaPool {
             coverage_pct,
         };
         {
+            // В DRY аккаунты не создаются, поэтому «реально открытых» почти нет,
+            // и гейт входа отсеял бы всех кандидатов подряд — симуляция
+            // проверяла бы только сама себя. Поэтому в dry готовым считается то,
+            // что пул ВЁЛ БЫ: гейт тогда проверяет настоящее условие («актив в
+            // нашем пуле»), а не наличие аккаунта, которого в dry быть и не может.
             let mut r = self.ready.lock().await;
-            *r = open.clone();
+            *r = if dry {
+                let mut eff = open.clone();
+                eff.extend(target.iter().map(|(m, _)| *m));
+                eff
+            } else {
+                open.clone()
+            };
         }
         {
             let mut t = self.tracked.lock().await;
