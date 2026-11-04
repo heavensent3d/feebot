@@ -52,6 +52,8 @@ pub struct Candidate {
     pub last_payout_age_secs: Option<u64>,
     /// Unix-время создания монеты (из борды). Возраст = главный фильтр.
     pub created_at: Option<i64>,
+    /// Сколько раздач монета уже сделала. 0 = не платила никогда.
+    pub payouts: Option<u64>,
 }
 
 pub struct Oracle {
@@ -92,8 +94,22 @@ impl Oracle {
 
     /// Догрузить `rewards` по монете (owed / distributed / lastPaidHolders).
     /// Отдельный per-coin запрос — дёргаем только для прошедших дешёвый прескрин.
-    /// Возвращает (owed_sol, distributed_sol, last_paid_holders, last_payout_age_secs).
-    pub async fn enrich_rewards(&self, mint: &Pubkey) -> Option<(f64, f64, u64, Option<u64>)> {
+    /// Возвращает (owed_sol, distributed_sol, last_paid_holders, last_payout_age_secs, payouts).
+    ///
+    /// `owed` — ГЛАВНЫЙ сигнал тайминга: это уже СНЯТОЕ с вольта и ещё не
+    /// розданное. Замер 60 входов danek: половина сделана при НУЛЕВОМ котле, и
+    /// такие входы приносят раздачу медианой 0.8350 SOL против 0.4378 у
+    /// входов с полным котлом — ноль в вольте значит «деньги уже у воркера,
+    /// раздача через минуту», а не «денег нет».
+    ///
+    /// `payouts` — сколько раздач монета уже сделала. Ноль значит «не платила
+    /// НИКОГДА»: из 11 его входов без выплаты 4 пришлись именно на такие, с
+    /// котлами до 1.59 SOL. Жирный котёл у них именно потому, что игра не
+    /// платит — тот же класс ловушки, что и hook koth.
+    pub async fn enrich_rewards(
+        &self,
+        mint: &Pubkey,
+    ) -> Option<(f64, f64, u64, Option<u64>, u64)> {
         let c = self.otc.coin_detail(&mint.to_string()).await.ok()?;
         let r = c.rewards?;
         let age = if r.last_distributed_at > 0 {
@@ -110,6 +126,7 @@ impl Oracle {
             r.distributed as f64 / 1e9,
             r.last_paid_holders,
             age,
+            r.payouts,
         ))
     }
 
@@ -209,6 +226,7 @@ impl Oracle {
             out.push(Candidate {
                 mint,
                 created_at,
+                payouts: c.rewards.as_ref().map(|r| r.payouts),
                 symbol: c.symbol.unwrap_or_default(),
                 reward_mint,
                 reward_token_account,

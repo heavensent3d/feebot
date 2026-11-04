@@ -159,10 +159,15 @@ impl Bot {
 /// протокол 12.5%, desk pot 10%, выкупы OTC 10%. Проверено на STOCKS, где
 /// distributed/earned сошлось с этой долей до копейки.
 const HOLDERS_CUT: f64 = 0.675;
-/// Фактическая цена round-trip по монете, доля от позиции. Замер по 17 живым
-/// сделкам: средняя −4.7%, минимальная −2.6% (две комиссии pump по 1% плюс
-/// спред). Берём минимальную как базу для подбора размера.
-const ROUND_TRIP_COST: f64 = 0.026;
+/// ЦЕНА КРУГА ПО МОНЕТЕ — доля от размера позиции.
+///
+/// 0.069, а не прежние 0.026. Прежняя цифра была ЛУЧШИМ случаем из наших 17
+/// кругов, и гейт на ней пропускал входы, которые в реальности не окупаются.
+/// Замер 61 круга прибыльного бота danek по дельте его кошелька: медиана
+/// −6.93% от входа (25-й перцентиль −11.93%, 75-й −2.68%, в плюсе 12 кругов
+/// из 61). Нога по монете системно убыточна, и так и задумано: зарабатывает
+/// реворд, а не цена.
+const ROUND_TRIP_COST: f64 = 0.069;
 
     /// РЕНТА АККАУНТА-КОТЛА. Клейм её не забирает, поэтому забрать можно только
     /// то, что выше: пот = lamports − рента.
@@ -1297,13 +1302,23 @@ const ROUND_TRIP_COST: f64 = 0.026;
             // Догружаем rewards (owed / distributed / lastPaidHolders) — объект приходит
             // ТОЛЬКО из /api/coins?mint=X. Это и есть сигналы отбора: платит ли монета
             // реально и на скольких холдеров делится выплата.
-            if let Some((owed, distributed, paid_holders, payout_age)) =
+            if let Some((owed, distributed, paid_holders, payout_age, payouts)) =
                 self.oracle.enrich_rewards(&c.mint).await
             {
                 c.owed_sol = Some(owed);
                 c.distributed_sol = Some(distributed);
                 c.last_paid_holders = Some(paid_holders);
                 c.last_payout_age_secs = payout_age;
+                c.payouts = Some(payouts);
+            }
+            // МОНЕТА, НЕ ПЛАТИВШАЯ НИ РАЗУ, — ловушка того же класса, что koth:
+            // котёл у неё жирный именно потому, что игра не раздаёт. Замер 60
+            // входов danek: из 11 его входов без выплаты 4 пришлись на такие,
+            // с котлами до 1.59 SOL.
+            if self.cfg.strategy.require_payout_history && c.payouts == Some(0) {
+                sk_pre2 += 1;
+                note(&mut reasons, "не раздавала ни разу (payouts=0)".to_string());
+                continue;
             }
             // Прескрин ещё раз — теперь с rewards-гейтами (роздано / холдеры / обвал).
             if let Verdict::Skip(r) = self.filters.prescreen(&c) {
@@ -1626,7 +1641,19 @@ const ROUND_TRIP_COST: f64 = 0.026;
         // ПЕРВОЙ выплатой, и собираем мы котёл на её момент.
         let hold_min = self.cfg.strategy.pot_growth_horizon_secs as f64 / 60.0;
         let pot_at_payout = pot_sol + pot_growth * hold_min;
-        let expected_reward_sol = pot_at_payout * Self::HOLDERS_CUT * share_frac;
+        // РАЗМЕР БУДУЩЕЙ РАЗДАЧИ = уже снятое с вольта плюс то, что снимут.
+        //
+        // `owed` — фисы, которые воркер УЖЕ забрал и ещё не роздал, то есть
+        // деньги в пути. Пустой вольт сам по себе ничего не значит: замер 60
+        // входов danek показал, что входы при НУЛЕВОМ котле дают раздачу
+        // медианой 0.8350 SOL против 0.4378 у входов с полным котлом — ноль
+        // значит «уже сняли, раздача через минуту», а не «денег нет».
+        //
+        // Коэффициент 0.706 измерен по 16 входам, где вольт ещё не сняли:
+        // раздача = 0.706 x котёл на входе, r = 0.961.
+        let owed_sol = c.owed_sol.unwrap_or(0.0);
+        let payout_sol = owed_sol + pot_at_payout * self.cfg.strategy.pot_to_payout_ratio;
+        let expected_reward_sol = payout_sol * share_frac;
 
         // ЦЕНА КРУГА. 2.6% от позиции — замер по 17 живым round-trip (две
         // комиссии pump по 1% плюс спред; средняя там −4.7%, берём лучшую как
@@ -1661,10 +1688,10 @@ const ROUND_TRIP_COST: f64 = 0.026;
         };
         info!(
             "{mint}: РАЗМЕР {buy_sol_dyn:.3} SOL, чужой флоат {float_sol:.4} SOL → доля {:.0}%; \
-             ФИС ожидаем {expected_reward_sol:.4} SOL (котёл {pot_sol:.4} + прирост {pot_growth:.4}/мин × {hold_min:.1}мин = {pot_at_payout:.4}, × {:.1}% холдерам × доля); \
+             ФИС ожидаем {expected_reward_sol:.4} SOL (уже снято {owed_sol:.4} + котёл {pot_at_payout:.4} × {:.3} → раздача {payout_sol:.4}, × доля); \
              круг стоит {round_trip:.4} SOL → EV ×{ev_ratio:.2}",
             share_frac * 100.0,
-            Self::HOLDERS_CUT * 100.0
+            self.cfg.strategy.pot_to_payout_ratio
         );
 
         // Порог ПЫЛИ: ниже этого реворд не продаётся вовсе и остаётся висеть
