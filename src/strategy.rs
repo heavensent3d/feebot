@@ -1543,15 +1543,7 @@ const ROUND_TRIP_COST: f64 = 0.026;
         // Сколько стока начислил раунд (raw-единицы) и его оценка в SOL (котировка).
         let reward_now = self.rpc.token_amount(reward_ata).await.unwrap_or(reward_baseline);
         let reward_raw = reward_now.saturating_sub(reward_baseline);
-        let reward_value_sol = if reward_raw > 0 {
-            self.jup
-                .quote(&c.reward_mint, &WSOL_MINT, reward_raw, self.jup.cfg().slippage_bps)
-                .await
-                .map(|q| Jupiter::out_amount(&q) as f64 / LAMPORTS_PER_SOL)
-                .unwrap_or(0.0)
-        } else {
-            0.0
-        };
+        let reward_value_sol = self.reward_value_sol(&c.reward_mint, reward_raw).await;
 
         // Разбивка расходов. tip релеев пока не трекаем per-tx (ground truth — сводка
         // по балансу); спам-кост — верхняя оценка (приземлившиеся-и-упавшие × base).
@@ -1871,6 +1863,27 @@ const ROUND_TRIP_COST: f64 = 0.026;
         Ok((false, attempts, sell_amount))
     }
 
+    /// Сколько SOL стоит начисленный реворд.
+    ///
+    /// Для WSOL котировка не нужна и ВРЕДНА: Jupiter на паре WSOL→WSOL отвечает
+    /// ошибкой, `unwrap_or(0.0)` обнулял бы реворд, и прибыльная сделка
+    /// выглядела бы убыточной — а `breakeven_exit_pct` считал бы профит
+    /// заниженным и выбрасывал нас из позиции сразу после выплаты. WSOL это уже
+    /// SOL: его raw-единицы И ЕСТЬ лампорты.
+    async fn reward_value_sol(&self, reward_mint: &Pubkey, reward_raw: u64) -> f64 {
+        if reward_raw == 0 {
+            return 0.0;
+        }
+        if *reward_mint == WSOL_MINT {
+            return reward_raw as f64 / LAMPORTS_PER_SOL;
+        }
+        self.jup
+            .quote(reward_mint, &WSOL_MINT, reward_raw, self.jup.cfg().slippage_bps)
+            .await
+            .map(|q| Jupiter::out_amount(&q) as f64 / LAMPORTS_PER_SOL)
+            .unwrap_or(0.0)
+    }
+
     /// Сброс накопленных reward-стоков в SOL через Jupiter.
     ///
     /// Сканируем ОБЕ token-программы: стоки бывают и Token-2022, и обычные SPL
@@ -1896,6 +1909,14 @@ const ROUND_TRIP_COST: f64 = 0.026;
         // Смысл позиции в том, чтобы ДОЖДАТЬСЯ выплаты, поэтому её монета для
         // этого цикла неприкосновенна.
         let held: HashSet<Pubkey> = self.active.lock().await.clone();
+        // ...И НЕ ТРОГАЕМ REWARD-АКТИВ ОТКРЫТОЙ ПОЗИЦИИ. Гейт выхода сторожит
+        // ИМЕННО баланс нашего reward-ATA («нам начислили сток» = раунд нас
+        // зачёл), сравнивая его с baseline, снятым на входе. Если этот цикл
+        // успеет сбросить начисленное раньше, чем гейт его увидит, баланс
+        // вернётся к baseline и выход не сработает НИКОГДА — позиция провисит
+        // до аварийного бейла. Для WSOL хуже: close_account пересоздаёт
+        // аккаунт, и Lighthouse-ассерт выхода сторожил бы новый пустой ATA.
+        let held_rewards: HashSet<Pubkey> = self.active_reward_mints.lock().await.clone();
 
         for ta in accs {
             if ta.amount == 0 {
@@ -1903,6 +1924,66 @@ const ROUND_TRIP_COST: f64 = 0.026;
             }
             if held.contains(&ta.mint) {
                 continue; // это открытая позиция, а не реворд
+            }
+            if held_rewards.contains(&ta.mint) {
+                continue; // сток открытой позиции — его сторожит гейт выхода
+            }
+            // WSOL-РЕВОРД НЕ СВОПАЕТСЯ — он уже SOL, просто завёрнутый, и
+            // Jupiter на паре WSOL→WSOL отвечает ошибкой. Без этой ветви
+            // заработанный фис навсегда оставался бы лежать в reward-ATA:
+            // своп падает, а инсинератор WSOL-аккаунт намеренно не трогает.
+            // Проверено 04.11.2026: у монеты верхушки борды (jV7eSrcE…,
+            // котёл 0.0936 SOL) rewardMint = So1111…112, то есть фис придёт
+            // именно в этом виде.
+            //
+            // Разворачиваем сами: `close_account` отдаёт владельцу И начисленный
+            // баланс, И ренту аккаунта, а следующей инструкцией того же tx
+            // открываем ATA заново (idempotent) — пустой reward-ATA это наше
+            // право на СЛЕДУЮЩУЮ выплату, раздача аккаунтов не создаёт.
+            if ta.mint == WSOL_MINT {
+                if ta.amount < min_lamports {
+                    continue; // пыль — рента на переоткрытие дороже
+                }
+                let sol = ta.amount as f64 / LAMPORTS_PER_SOL;
+                if self.cfg.strategy.dry_run {
+                    info!("[DRY] UNWRAP реворда WSOL: развернул бы {sol:.4} SOL");
+                    continue;
+                }
+                let ixs = vec![
+                    spl_token::instruction::close_account(
+                        &TOKEN_PROGRAM,
+                        &ta.address,
+                        &owner,
+                        &owner,
+                        &[],
+                    )?,
+                    spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                        &owner,
+                        &owner,
+                        &WSOL_MINT,
+                        &TOKEN_PROGRAM,
+                    ),
+                ];
+                let mut tx_ixs = compute_budget(60_000, self.cfg.strategy.sell_cu_price).to_vec();
+                tx_ixs.extend(ixs);
+                let bh = self.rpc.latest_blockhash().await?;
+                let tx = crate::txbuild::build_signed(&self.payer, &tx_ixs, bh, &no_alts(), &[])?;
+                let wire = B64.encode(bincode::serialize(&tx).map_err(|e| anyhow!("serialize unwrap: {e}"))?);
+                match self
+                    .rpc
+                    .raw(
+                        "sendTransaction",
+                        serde_json::json!([wire, {"encoding":"base64","skipPreflight":true,"maxRetries":3}]),
+                    )
+                    .await
+                {
+                    Ok(v) => info!(
+                        "UNWRAP реворда WSOL: {sol:.4} SOL → кошелёк: {}",
+                        v.as_str().unwrap_or("отправлено")
+                    ),
+                    Err(e) => warn!("UNWRAP реворда WSOL ({sol:.4} SOL): {e}"),
+                }
+                continue;
             }
             let quote = match self
                 .jup
@@ -2233,15 +2314,7 @@ const ROUND_TRIP_COST: f64 = 0.026;
         // Сколько стоит начисленный реворд (по котировке Jupiter).
         let reward_now = self.rpc.token_amount(reward_ata).await.unwrap_or(reward_baseline);
         let reward_raw = reward_now.saturating_sub(reward_baseline);
-        let reward_sol = if reward_raw > 0 {
-            self.jup
-                .quote(reward_mint, &WSOL_MINT, reward_raw, self.jup.cfg().slippage_bps)
-                .await
-                .map(|q| Jupiter::out_amount(&q) as f64 / LAMPORTS_PER_SOL)
-                .unwrap_or(0.0)
-        } else {
-            0.0
-        };
+        let reward_sol = self.reward_value_sol(reward_mint, reward_raw).await;
         Some(((coin_sol + reward_sol) / cost - 1.0) * 100.0)
     }
 
