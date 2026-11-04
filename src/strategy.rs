@@ -96,6 +96,11 @@ pub struct Bot {
     /// Рента аккаунта-котла в лампортах (0 = ещё не спрашивали). Клейм её не
     /// забирает, поэтому пот = lamports − рента.
     vault_rent_lamports: std::sync::atomic::AtomicU64,
+    /// Когда последний раз печатали каждое сообщение «входы на паузе».
+    /// Тик входа идёт каждые `poll_ms` (400 мс), поэтому без троттла пауза
+    /// заливает журнал: на первом запуске это 300 строк за две минуты, в
+    /// которых тонет всё остальное.
+    pause_log: Arc<Mutex<HashMap<&'static str, std::time::Instant>>>,
     /// ПОСТОЯННО ОТКРЫТЫЕ ATA под reward-активы. Раздача аккаунтов не создаёт,
     /// поэтому право на выплату нужно иметь ЗАРАНЕЕ, а не добывать транзакцией
     /// перед покупкой. Пул же позволяет гейтовать вход: монета, под чей актив
@@ -133,6 +138,7 @@ impl Bot {
             watch_creators: Arc::new(Mutex::new(HashMap::new())),
             pot_cache: Arc::new(Mutex::new(HashMap::new())),
             vault_rent_lamports: std::sync::atomic::AtomicU64::new(0),
+            pause_log: Arc::new(Mutex::new(HashMap::new())),
             ata_pool: Arc::new(AtaPool::new()),
             no_template: Arc::new(Mutex::new(HashMap::new())),
             coin_fees: Arc::new(Mutex::new(HashMap::new())),
@@ -186,6 +192,21 @@ const ROUND_TRIP_COST: f64 = 0.026;
     /// Пот — то, что воркер реально может забрать из котла.
     fn pot_of(lamports: u64, rent: u64) -> f64 {
         lamports.saturating_sub(rent) as f64 / LAMPORTS_PER_SOL
+    }
+
+    /// Сообщение о паузе — не чаще раза в 30 секунд на причину. Причину знать
+    /// надо (иначе «работает, но молчит» не отличить от «сломан»), но повторять
+    /// её 2.5 раза в секунду незачем.
+    async fn pause_note(&self, key: &'static str, msg: &str) {
+        let mut m = self.pause_log.lock().await;
+        let fire = m
+            .get(key)
+            .map(|t| t.elapsed().as_secs() >= 30)
+            .unwrap_or(true);
+        if fire {
+            m.insert(key, std::time::Instant::now());
+            info!("{msg}");
+        }
     }
 
     /// Будилка цикла входа (её дёргает шред-консьюмер).
@@ -607,7 +628,16 @@ const ROUND_TRIP_COST: f64 = 0.026;
     /// в корзине. Платят ТЕКУЩИМ (в интерфейсе он помечен PAYING NOW), а корзина
     /// это страховка от ротации, которая случается уже после выплаты.
     pub async fn reward_ranking(&self) -> Result<Vec<(Pubkey, u64)>> {
-        let cands = self.oracle.candidates().await?;
+        // ВСЯ борда, а не десять страниц «свежих». Пул ATA — это гейт входа:
+        // монета, под чей reward-актив аккаунта нет, отсеивается до RPC. Греть
+        // пул по одной вселенной монет, а кандидатов брать из другой — значит
+        // резать именно то, за чем пришли: в первом драе так ушло 81 из 600
+        // кандидатов вотчлиста. Замер покрытия (top 124 актива = 99.8% монет)
+        // тоже считался по ВСЕЙ борде.
+        let cands = self
+            .oracle
+            .candidates_all(60, self.cfg.strategy.board_sweep_concurrency as usize)
+            .await?;
         let mut now: HashMap<Pubkey, u64> = HashMap::new();
         let mut inbasket: HashMap<Pubkey, u64> = HashMap::new();
         for c in &cands {
@@ -896,7 +926,8 @@ const ROUND_TRIP_COST: f64 = 0.026;
         // монете. Покупать в таком состоянии значит гарантированно заплатить
         // round-trip и не получить фис.
         if !self.ata_pool.warmed() {
-            info!("пул ATA ещё не прогрет — входы на паузе");
+            self.pause_note("ata", "пул ATA ещё не прогрет — входы на паузе")
+                .await;
             return Ok(());
         }
         // КАНДИДАТЫ — ИЗ ВОТЧЛИСТА ПОЛНОГО ОБХОДА БОРДЫ. Пустой вотчлист
@@ -905,7 +936,8 @@ const ROUND_TRIP_COST: f64 = 0.026;
         // гарантированно не содержит цели.
         let mut cands = { self.board.lock().await.clone() };
         if cands.is_empty() {
-            info!("вотчлист борды ещё не собран — входы на паузе");
+            self.pause_note("board", "вотчлист борды ещё не собран — входы на паузе")
+                .await;
             return Ok(());
         }
         // РАНЖИРОВАНИЕ ПО КОТЛУ. Цикл ниже берёт ПЕРВОГО прошедшего кандидата,
@@ -946,6 +978,8 @@ const ROUND_TRIP_COST: f64 = 0.026;
         // и «работает, но ничего не подходит» не отличить от «сломан» — именно на
         // этом мы потеряли время на первом боевом запуске.
         let total = cands.len();
+        // Верхушка по котлу — для разбора, почему именно она не прошла.
+        let top5: Vec<Candidate> = cands.iter().take(5).cloned().collect();
         let (mut sk_active, mut sk_cooldown, mut sk_rounds, mut sk_notpl) = (0, 0, 0, 0);
         let mut sk_noata = 0usize;
         let (mut sk_pre1, mut sk_pre2, mut sk_float, mut sk_eval, mut sk_rmint) = (0, 0, 0, 0, 0);
@@ -1115,18 +1149,60 @@ const ROUND_TRIP_COST: f64 = 0.026;
             });
         }
         if considered == 0 {
+            // ЧТО В ВЕРХУШКЕ. При молчании бота первый вопрос — «почему не
+            // взяли лучший котёл», и ответ должен быть в логе, а не в голове:
+            // агрегат по 600 кандидатам его не даёт.
+            let rows: Vec<(Pubkey, String, f64, f64, f64, i64, Pubkey)> = {
+                let pots = self.pot_cache.lock().await;
+                top5.iter()
+                    .map(|c| {
+                        (
+                            c.mint,
+                            c.symbol.clone(),
+                            pots.get(&c.mint).map(|(p, _, _)| *p).unwrap_or(0.0),
+                            c.volume_24h_usd.unwrap_or(-1.0),
+                            c.market_cap_usd.unwrap_or(-1.0),
+                            c.holders.map(|h| h as i64).unwrap_or(-1),
+                            c.reward_mint,
+                        )
+                    })
+                    .collect()
+            };
+            let mut notes = Vec::new();
+            for (mint, sym, pot, vol, mcap, hold, rm) in rows {
+                let ata = if self.ata_pool.is_ready(&rm).await {
+                    "есть"
+                } else {
+                    "НЕТ"
+                };
+                notes.push(format!(
+                    "{sym}/{} пот {pot:.4} vol ${vol:.0} капа ${mcap:.0} холдеров {hold} ATA {ata}",
+                    &mint.to_string()[..6]
+                ));
+            }
+            if !notes.is_empty() {
+                self.pause_note("top5", &format!("верхушка по котлу: {}", notes.join(" | ")))
+                    .await;
+            }
             // Говорим ВСЛУХ, почему ни один кандидат не подошёл.
-            info!(
-                "tick: из {total} кандидатов не подошёл никто — отсев: держим {sk_active}, \
-                 кулдаун {sk_cooldown}, нет ATA под актив {sk_noata}, нет раундов {sk_rounds}, нет шаблона {sk_notpl}, \
-                 прескрин {sk_pre1}, реворды {sk_pre2}, флоат {sk_float}, EV {sk_eval}, \
-                 сток занят {sk_rmint}"
-            );
-            let mut top: Vec<_> = reasons.into_iter().collect();
-            top.sort_by(|a, b| b.1.cmp(&a.1));
-            let top: Vec<String> = top.iter().take(5).map(|(r, n)| format!("{r} ×{n}")).collect();
-            if !top.is_empty() {
-                info!("tick: что именно режет — {}", top.join(" | "));
+            self.pause_note(
+                "sieve",
+                &format!(
+                    "tick: из {total} кандидатов не подошёл никто — отсев: \
+                     держим {sk_active}, кулдаун {sk_cooldown}, \
+                     нет ATA под актив {sk_noata}, нет раундов {sk_rounds}, \
+                     нет шаблона {sk_notpl}, прескрин {sk_pre1}, \
+                     реворды {sk_pre2}, флоат {sk_float}, EV {sk_eval}, \
+                     сток занят {sk_rmint}"
+                ),
+            )
+            .await;
+            let mut why: Vec<_> = reasons.into_iter().collect();
+            why.sort_by(|a, b| b.1.cmp(&a.1));
+            let why: Vec<String> = why.iter().take(5).map(|(r, n)| format!("{r} ×{n}")).collect();
+            if !why.is_empty() {
+                self.pause_note("why", &format!("tick: что именно режет — {}", why.join(" | ")))
+                    .await;
             }
         }
         if considered > 0 {
@@ -1247,10 +1323,26 @@ const ROUND_TRIP_COST: f64 = 0.026;
 
         // ЦЕНА КРУГА. 2.6% от позиции — замер по 17 живым round-trip (две
         // комиссии pump по 1% плюс спред; средняя там −4.7%, берём лучшую как
-        // базу). Бюджет пролива добавляем ТОЛЬКО если гонка включена: при
-        // exit_spam_tps = 0 выход идёт дешёвым опросом и ничего не жжёт.
+        // базу).
+        //
+        // Пролив считаем по ОЖИДАЕМОЙ трате, а не по `exit_spam_max_sol`: это
+        // жёсткий лимит (0.08 SOL), и подставлять его в цену круга значит
+        // считать, что пролив всегда выжрет лимит. Так и вышло в первом драе:
+        // круг «стоил» 0.119 SOL вместо 0.039, и лучший котёл борды давал
+        // EV ×0.13 вместо ×1.7 — гейт снова запрещал всё, теперь по другой
+        // причине. Падающая транзакция стоит base_fee + приоритет, а приоритет
+        // на продаже у нас 1 µL/CU:
+        //     5000 + 1 × 800 000 / 1e6 ≈ 5001 лампорт ≈ 0.000005 SOL
+        // то есть минута пролива на 1 tx/s — это 0.0003 SOL, а не 0.08.
         let spam_budget = if self.cfg.strategy.exit_spam_tps > 0 {
-            self.cfg.strategy.exit_spam_max_sol
+            let per_attempt = (5_000.0
+                + self.cfg.strategy.sell_cu_price as f64
+                    * self.cfg.strategy.sell_cu_limit as f64
+                    / 1e6)
+                / LAMPORTS_PER_SOL;
+            let attempts = self.cfg.strategy.exit_spam_tps as f64
+                * self.cfg.strategy.exit_spam_window_secs as f64;
+            (per_attempt * attempts).min(self.cfg.strategy.exit_spam_max_sol)
         } else {
             0.0
         };
