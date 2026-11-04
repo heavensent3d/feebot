@@ -127,6 +127,36 @@ impl Oracle {
         sort: &str,
     ) -> Result<Vec<Candidate>> {
         let coins = self.otc.coins_sorted(pages, size, sort).await?;
+        let mut out = self.map_coins(coins);
+        // ПОРЯДОК ПЕРЕБОРА = выбор позиции: tick_entries берёт ПЕРВОГО прошедшего,
+        // а не лучшего. Здесь, где котёл ещё не измерен, лучшее доступное
+        // приближение — число холдеров: реворд делится пропорционально токенам
+        // (проверено на Takara: наши 9.78M против 37.5M конкурента дали ровно
+        // 20.7% выплаты). В основном пути кандидаты приходят из `candidates_all`
+        // и пересортировываются по РЕАЛЬНОМУ котлу.
+        out.sort_by(|a, b| {
+            let ha = a.holders.unwrap_or(u64::MAX);
+            let hb = b.holders.unwrap_or(u64::MAX);
+            ha.cmp(&hb)
+                .then(b.volume_24h_usd.partial_cmp(&a.volume_24h_usd).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        Ok(out)
+    }
+
+    /// Кандидаты со ВСЕЙ борды — основной источник отбора.
+    ///
+    /// Десять страниц «свежих» целью не были никогда: котла в списочном ответе
+    /// нет, сортировать по нему борда не умеет, а монеты с набранным котлом
+    /// рассыпаны по всем 67 тысячам записей (замер 04.11.2026: котёл ≥0.05 SOL
+    /// у пяти монет из 67 714). Порядок здесь НЕ назначается — котлы считает и
+    /// ранжирует `Bot::sweep_board` уже из чейна.
+    pub async fn candidates_all(&self, size: usize, conc: usize) -> Result<Vec<Candidate>> {
+        let coins = self.otc.coins_all(size, conc).await?;
+        Ok(self.map_coins(coins))
+    }
+
+    /// Разбор записей борды в кандидатов. Порядок списка НЕ меняет.
+    fn map_coins(&self, coins: Vec<crate::otc::OtcCoin>) -> Vec<Candidate> {
         let mut out = Vec::new();
         for c in coins {
             let Ok(mint) = Pubkey::from_str(&c.mint) else {
@@ -182,19 +212,6 @@ impl Oracle {
                 last_payout_age_secs: None,
             });
         }
-        // ПОРЯДОК ПЕРЕБОРА = выбор позиции: tick_entries берёт ПЕРВОГО прошедшего,
-        // а не лучшего, поэтому сортируем так, чтобы первым шёл самый выгодный.
-        // Решает число холдеров: реворд делится пропорционально токенам, и это
-        // проверено на Takara — наши 9.78M против 37.5M конкурента дали ровно
-        // 20.7% выплаты. Монета с одним холдером отдаёт нам кратно больше, чем
-        // та же монета с пятью. Холдеры приходят из борды бесплатно, в отличие
-        // от котла, за которым надо идти отдельным запросом на каждую монету.
-        out.sort_by(|a, b| {
-            let ha = a.holders.unwrap_or(u64::MAX);
-            let hb = b.holders.unwrap_or(u64::MAX);
-            ha.cmp(&hb)
-                .then(b.volume_24h_usd.partial_cmp(&a.volume_24h_usd).unwrap_or(std::cmp::Ordering::Equal))
-        });
-        Ok(out)
+        out
     }
 }

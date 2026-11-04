@@ -210,6 +210,85 @@ impl OtcClient {
         Ok(out)
     }
 
+
+    /// ВСЯ БОРДА, страницами параллельно и с дедупом по минту.
+    ///
+    /// Зачем это вообще нужно. Котла монеты в списочном ответе НЕТ — приходят
+    /// только mint/name/symbol/image/createdAt/rewardMint/rewardBasket/
+    /// rewardCycle/category. Сортировать борду по котлу API не умеет: из всех
+    /// значений `sort` он принимает РОВНО ДВА, `volume24h` и `marketCap`, а
+    /// любое другое (в том числе наш прежний `fresh`) молча отдаёт дефолтный
+    /// порядок. Размер страницы упёрт в 60 (size=1000 вернул 60).
+    ///
+    /// Значит единственный способ найти монету с набранным котлом — обойти
+    /// борду ЦЕЛИКОМ и посчитать котлы самому. Замер 04.11.2026: 67 714 монет,
+    /// котёл ≥0.05 SOL был у ПЯТИ, ≥0.01 — у четырнадцати, и лежат они где
+    /// угодно, только не на первых десяти страницах.
+    ///
+    /// Последовательно это 1131 запрос по ~300 мс = почти шесть минут, и к
+    /// концу прохода котлы начала списка уже устарели (клеймят раз в 4-5 мин).
+    /// Поэтому страницы тянем волнами по `conc` штук.
+    ///
+    /// Сорт берём `volume24h`: он у API настоящий, то есть порядок страниц
+    /// устойчив. На дефолтном порядке (свежие) борда сдвигается от каждой новой
+    /// монеты, и страницы начинают терять/дублировать записи — от дублей
+    /// страхуемся множеством минтов, от потерь устойчивым сортом.
+    pub async fn coins_all(&self, size: usize, conc: usize) -> Result<Vec<OtcCoin>> {
+        const MAX_PAGES: usize = 2400;
+        let size = size.clamp(1, 60);
+        let conc = conc.clamp(1, 32);
+        let mut out: Vec<OtcCoin> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut page = 0usize;
+        let mut errs = 0usize;
+        let mut first_err: Option<anyhow::Error> = None;
+        while page < MAX_PAGES {
+            let mut set: tokio::task::JoinSet<(usize, Result<Vec<OtcCoin>>)> =
+                tokio::task::JoinSet::new();
+            for p in page..page + conc {
+                let me = self.clone();
+                set.spawn(async move { (p, me.coins_page(p, size, "volume24h").await) });
+            }
+            let mut wave: Vec<(usize, Vec<OtcCoin>)> = Vec::new();
+            // Конец борды — это ПУСТАЯ страница, а не ошибка. Ошибку на одной
+            // странице из тысячи нельзя считать концом: так обход обрывался бы
+            // на случайном таймауте и отдавал огрызок вместо борды.
+            let mut ended = false;
+            while let Some(r) = set.join_next().await {
+                let Ok((p, res)) = r else { continue };
+                match res {
+                    Ok(v) if v.is_empty() => ended = true,
+                    Ok(v) => wave.push((p, v)),
+                    Err(e) => {
+                        errs += 1;
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                    }
+                }
+            }
+            wave.sort_by_key(|(p, _)| *p);
+            for (_, v) in wave {
+                for c in v {
+                    if seen.insert(c.mint.clone()) {
+                        out.push(c);
+                    }
+                }
+            }
+            if ended {
+                break;
+            }
+            page += conc;
+        }
+        if out.is_empty() {
+            return Err(first_err.unwrap_or_else(|| anyhow::anyhow!("борда вернула пусто")));
+        }
+        if errs > 0 {
+            tracing::warn!("обход борды: страниц с ошибкой {errs}, собрано монет {}", out.len());
+        }
+        Ok(out)
+    }
+
     /// Детали ОДНОЙ монеты — единственный путь получить объект `rewards`
     /// (owed / distributed / lastPaidHolders).
     pub async fn coin_detail(&self, mint: &str) -> Result<OtcCoin> {

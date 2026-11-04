@@ -82,14 +82,20 @@ pub struct Bot {
     recent_trade: Arc<Mutex<HashMap<Pubkey, std::time::Instant>>>,
     /// Будилка цикла входа: шреды будят немедленный опрос борды OTC.
     poll_now: Arc<Notify>,
-    /// mint → (заполнение котла в %, когда измерено). Обновляется ФОНОВЫМ
-    /// параллельным обходом: последовательный опрос стоит 851 мс на монету, то
-    /// есть полный проход по 500 кандидатам занимал бы 426 секунд, и котлы за
-    /// это время успевают смениться. При 20 одновременных запросах тот же обход
-    /// укладывается в 33 секунды, и тик может выбирать САМЫЙ полный котёл, а не
-    /// первый попавшийся.
-    /// mint → (заполнение %, котёл SOL, прирост SOL/мин, когда измерено).
-    pot_cache: Arc<Mutex<HashMap<Pubkey, (f64, f64, f64, std::time::Instant)>>>,
+    /// ВОТЧЛИСТ: кандидаты со ВСЕЙ борды, отранжированные по РЕАЛЬНОМУ котлу
+    /// из чейна. Это и есть источник отбора — см. `sweep_board`. Прежний
+    /// источник (десять страниц «свежих») цели не содержал: котла в списочном
+    /// ответе борды нет, сортировать по нему API не умеет, а монеты с набранным
+    /// котлом рассыпаны по всем 67 тысячам записей.
+    board: Arc<Mutex<Vec<Candidate>>>,
+    /// mint → creator для монет вотчлиста. Котёл живёт на PDA создателя, и эта
+    /// карта избавляет быстрый перечёт от повторного чтения кривых.
+    watch_creators: Arc<Mutex<HashMap<Pubkey, Pubkey>>>,
+    /// mint → (котёл SOL за вычетом ренты, прирост SOL/мин, когда измерено).
+    pot_cache: Arc<Mutex<HashMap<Pubkey, (f64, f64, std::time::Instant)>>>,
+    /// Рента аккаунта-котла в лампортах (0 = ещё не спрашивали). Клейм её не
+    /// забирает, поэтому пот = lamports − рента.
+    vault_rent_lamports: std::sync::atomic::AtomicU64,
     /// ПОСТОЯННО ОТКРЫТЫЕ ATA под reward-активы. Раздача аккаунтов не создаёт,
     /// поэтому право на выплату нужно иметь ЗАРАНЕЕ, а не добывать транзакцией
     /// перед покупкой. Пул же позволяет гейтовать вход: монета, под чей актив
@@ -123,7 +129,10 @@ impl Bot {
             active_reward_mints: Arc::new(Mutex::new(HashSet::new())),
             sol_price: Arc::new(Mutex::new((0.0, std::time::Instant::now()))),
             exit_registry: Arc::new(Mutex::new(HashMap::new())),
+            board: Arc::new(Mutex::new(Vec::new())),
+            watch_creators: Arc::new(Mutex::new(HashMap::new())),
             pot_cache: Arc::new(Mutex::new(HashMap::new())),
+            vault_rent_lamports: std::sync::atomic::AtomicU64::new(0),
             ata_pool: Arc::new(AtaPool::new()),
             no_template: Arc::new(Mutex::new(HashMap::new())),
             coin_fees: Arc::new(Mutex::new(HashMap::new())),
@@ -144,6 +153,40 @@ const HOLDERS_CUT: f64 = 0.675;
 /// сделкам: средняя −4.7%, минимальная −2.6% (две комиссии pump по 1% плюс
 /// спред). Берём минимальную как базу для подбора размера.
 const ROUND_TRIP_COST: f64 = 0.026;
+
+    /// РЕНТА АККАУНТА-КОТЛА. Клейм её не забирает, поэтому забрать можно только
+    /// то, что выше: пот = lamports − рента.
+    ///
+    /// Замер 04.11.2026 по семи клеймам монеты EVYRrux8: после каждого в котле
+    /// остаётся РОВНО 0.000650 SOL = 650 240 лампортов =
+    /// `getMinimumBalanceForRentExemption(0)` при текущей ставке ренты (2540
+    /// лампортов за байт-год). Отсюда же поправка к прежнему выводу:
+    /// расхождение +0.00089 между чейном и витриной OTC — не «чейн опережает
+    /// их API», а ровно эта рента.
+    ///
+    /// Ставку НЕ хардкодим: сеть её уже снижала (было 3480, и 0-байтный
+    /// аккаунт стоил 890 880). Спрашиваем один раз на процесс.
+    async fn vault_rent(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        let cached = self.vault_rent_lamports.load(Ordering::Relaxed);
+        if cached > 0 {
+            return cached;
+        }
+        let got = self
+            .rpc
+            .raw("getMinimumBalanceForRentExemption", serde_json::json!([0]))
+            .await
+            .ok()
+            .and_then(|v| v.as_u64())
+            .unwrap_or(650_240);
+        self.vault_rent_lamports.store(got, Ordering::Relaxed);
+        got
+    }
+
+    /// Пот — то, что воркер реально может забрать из котла.
+    fn pot_of(lamports: u64, rent: u64) -> f64 {
+        lamports.saturating_sub(rent) as f64 / LAMPORTS_PER_SOL
+    }
 
     /// Будилка цикла входа (её дёргает шред-консьюмер).
     pub fn poll_now(&self) -> Arc<Notify> {
@@ -328,10 +371,12 @@ const ROUND_TRIP_COST: f64 = 0.026;
     /// читать его «как котёл монеты» было бы завышением. Поэтому замер отдельно
     /// считает, сколько монет приходится на одного создателя.
     pub async fn scan_pots(&self, pages: usize, size: usize, sort: &str) -> Result<()> {
+        let rent = self.vault_rent().await;
         let cands = self.oracle.candidates_with(pages, size, sort).await?;
         info!(
-            "ЗАМЕР КОТЛОВ: сорт={sort}, {pages} страниц по {size} -> монет {}",
-            cands.len()
+            "ЗАМЕР КОТЛОВ: сорт={sort}, {pages} страниц по {size} -> монет {} (рента котла {:.6} SOL вычитается)",
+            cands.len(),
+            rent as f64 / LAMPORTS_PER_SOL
         );
 
         // 1. Кривые батчами: оттуда creator и признак выпуска.
@@ -406,7 +451,7 @@ const ROUND_TRIP_COST: f64 = 0.026;
             let vals = v["value"].as_array().cloned().unwrap_or_default();
             for (cr, item) in chunk.iter().zip(vals.iter()) {
                 let lam = item["lamports"].as_u64().unwrap_or(0);
-                pots.insert(*cr, lam as f64 / LAMPORTS_PER_SOL);
+                pots.insert(*cr, Self::pot_of(lam, rent));
             }
         }
 
@@ -635,80 +680,208 @@ const ROUND_TRIP_COST: f64 = 0.026;
         }
     }
 
-    /// ФОНОВЫЙ ОБХОД КОТЛОВ. Тянет борду и опрашивает `/api/vault` по всем
-    /// кандидатам ПАРАЛЛЕЛЬНО, складывая заполнение в `pot_cache`.
+    /// ПОЛНЫЙ ОБХОД БОРДЫ ПО КОТЛУ — он же источник кандидатов.
     ///
-    /// Зачем отдельный цикл: заполнение котла — единственный сигнал «выплата
-    /// близко», но он живёт в per-coin запросе. Последовательно это 851 мс на
-    /// монету (замер), то есть 426 секунд на 500 кандидатов — за такой проход
-    /// котлы полностью обновляются, и вход получался по случайной монете.
-    /// При 20 одновременных запросах тот же проход занимает 33 секунды.
-    /// HTTP к борде бесплатный, RPC здесь не трогается вовсе.
-    pub async fn pot_scan_loop(self: Arc<Self>) {
-        let conc = self.cfg.strategy.pot_scan_concurrency.max(1) as usize;
-        let every = std::time::Duration::from_secs(self.cfg.strategy.pot_scan_interval_secs.max(5));
+    /// Прежний источник (десять страниц «свежих», 600 монет) не мог найти цель
+    /// в принципе, и это измерено 04.11.2026: котла в списочном ответе борды
+    /// нет вовсе, сортировать по котлу API не умеет (принимает ровно два
+    /// сорта — `volume24h` и `marketCap`), а монеты с набранным котлом
+    /// рассыпаны по всем 67 тысячам записей: котёл ≥0.05 SOL был у ПЯТИ монет
+    /// из 67 714. Поэтому борду обходим целиком и считаем котлы сами:
+    ///     mint → bonding_curve → creator (байты 49..81) → creator_vault
+    ///          → lamports − рента
+    /// Всё батчами по 100 аккаунтов, то есть несколько сотен RPC-вызовов на
+    /// обход вместо 67 тысяч.
+    ///
+    /// Результат обхода — ВОТЧЛИСТ: top-N монет по поту. Тайминг входа от
+    /// длительности обхода не зависит: котлы вотчлиста перечитывает
+    /// `pot_refresh_loop` за секунды.
+    pub async fn board_sweep_loop(self: Arc<Self>) {
+        let every =
+            std::time::Duration::from_secs(self.cfg.strategy.board_sweep_interval_secs.max(60));
         loop {
             let started = std::time::Instant::now();
-            let cands = match self.oracle.candidates().await {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!("обход котлов: борда недоступна ({e})");
-                    tokio::time::sleep(every).await;
+            match self.sweep_board().await {
+                Ok((seen, kept, best)) => info!(
+                    "обход борды: {seen} монет на кривой за {:.0}с, вотчлист {kept}, лучший котёл {best:.4} SOL",
+                    started.elapsed().as_secs_f64()
+                ),
+                Err(e) => warn!("обход борды: {e:#}"),
+            }
+            tokio::time::sleep(every.saturating_sub(started.elapsed())).await;
+        }
+    }
+
+    /// Один полный обход борды: собрать вотчлист по РЕАЛЬНОМУ коту из чейна.
+    /// Возвращает (монет на кривой, монет в вотчлисте, лучший пот в SOL).
+    pub async fn sweep_board(&self) -> Result<(usize, usize, f64)> {
+        let rent = self.vault_rent().await;
+        let cands = self
+            .oracle
+            .candidates_all(60, self.cfg.strategy.board_sweep_concurrency as usize)
+            .await?;
+
+        // 1. Кривые батчами: оттуда creator и признак выпуска. Выпустившиеся
+        //    торгуются на pAMM и вне MVP — выкидываем сразу, чтобы они не
+        //    занимали места в вотчлисте.
+        let mut creator_of: HashMap<Pubkey, Pubkey> = HashMap::new();
+        let mut alive: Vec<Candidate> = Vec::with_capacity(cands.len());
+        for chunk in cands.chunks(100) {
+            let keys: Vec<String> = chunk
+                .iter()
+                .map(|c| pumpfun::bonding_curve(&c.mint).to_string())
+                .collect();
+            let Ok(v) = self
+                .rpc
+                .raw(
+                    "getMultipleAccounts",
+                    serde_json::json!([keys, {"encoding":"base64"}]),
+                )
+                .await
+            else {
+                continue;
+            };
+            let vals = v["value"].as_array().cloned().unwrap_or_default();
+            for (c, item) in chunk.iter().zip(vals.iter()) {
+                let Some(b64) = item["data"][0].as_str() else {
+                    continue;
+                };
+                let Ok(raw) = B64.decode(b64) else { continue };
+                let Ok(cv) = pumpfun::parse_curve(&raw) else {
+                    continue;
+                };
+                if cv.complete {
                     continue;
                 }
-            };
-            let floor_cfg = self.cfg.strategy.payout_floor_sol;
-            let mut fresh: HashMap<Pubkey, (f64, f64, f64, std::time::Instant)> = HashMap::new();
-            let mut it = cands.into_iter();
-            let prev = self.pot_cache.lock().await.clone();
-            let mut set: tokio::task::JoinSet<Option<(Pubkey, f64, f64)>> =
-                tokio::task::JoinSet::new();
-            loop {
-                // Держим ровно `conc` запросов в полёте.
-                while set.len() < conc {
-                    let Some(c) = it.next() else { break };
-                    let me = Arc::clone(&self);
-                    set.spawn(async move {
-                        let v = me.oracle.vault(&c.mint.to_string()).await.ok()?;
-                        if v.graduated {
-                            return None;
-                        }
-                        Some((c.mint, v.fill_pct(floor_cfg), v.waiting_sol))
-                    });
-                }
-                match set.join_next().await {
-                    Some(Ok(Some((mint, fill, pot)))) => {
-                        // СКОРОСТЬ НАПОЛНЕНИЯ — главный признак живого котла.
-                        // Замер 27.10.2026: из 18 монет котёл рос только у ДВУХ,
-                        // остальные стояли намертво, включая монеты с объёмом
-                        // $10 943 и $8 026. volume24h ничего не предсказывает —
-                        // это суточный агрегат, монета могла торговаться вчера.
-                        let now = std::time::Instant::now();
-                        let rate = prev
-                            .get(&mint)
-                            .map(|(_, old_pot, _, t)| {
-                                let mins = t.elapsed().as_secs_f64() / 60.0;
-                                if mins > 0.05 { (pot - old_pot) / mins } else { 0.0 }
-                            })
-                            .unwrap_or(0.0);
-                        fresh.insert(mint, (fill, pot, rate, now));
-                    }
-                    Some(_) => {}
-                    None => break,
-                }
+                creator_of.insert(c.mint, cv.creator);
+                alive.push(c.clone());
             }
-            let ready = fresh
-                .values()
-                .filter(|(f, _, _, _)| *f >= self.cfg.strategy.min_vault_fill_pct)
-                .count();
-            let growing = fresh.values().filter(|(_, _, r, _)| *r > 1e-9).count();
+        }
+        let on_curve = alive.len();
+
+        // 2. Котлы батчами по создателям.
+        let pots = self.read_pots(&creator_of, rent).await;
+
+        // 3. Ранжируем по поту и оставляем вотчлист.
+        let mut ranked: Vec<(f64, Candidate)> = alive
+            .into_iter()
+            .map(|c| {
+                let pot = creator_of
+                    .get(&c.mint)
+                    .and_then(|cr| pots.get(cr))
+                    .copied()
+                    .unwrap_or(0.0);
+                (pot, c)
+            })
+            .collect();
+        ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.truncate(self.cfg.strategy.watchlist_size.max(1));
+        let best = ranked.first().map(|(p, _)| *p).unwrap_or(0.0);
+        let kept = ranked.len();
+
+        let now = std::time::Instant::now();
+        let mut watch: HashMap<Pubkey, Pubkey> = HashMap::new();
+        let mut fresh: HashMap<Pubkey, (f64, f64, std::time::Instant)> = HashMap::new();
+        let mut board: Vec<Candidate> = Vec::with_capacity(kept);
+        for (pot, c) in ranked {
+            if let Some(cr) = creator_of.get(&c.mint) {
+                watch.insert(c.mint, *cr);
+            }
+            fresh.insert(c.mint, (pot, 0.0, now));
+            board.push(c);
+        }
+        *self.board.lock().await = board;
+        *self.watch_creators.lock().await = watch;
+        *self.pot_cache.lock().await = fresh;
+        Ok((on_curve, kept, best))
+    }
+
+    /// Котлы по карте mint→creator, батчами по 100 аккаунтов.
+    /// Котёл один НА СОЗДАТЕЛЯ, не на монету, поэтому дедуплицируем (на
+    /// практике у создателя одна монета — проверено на всей борде).
+    async fn read_pots(
+        &self,
+        creator_of: &HashMap<Pubkey, Pubkey>,
+        rent: u64,
+    ) -> HashMap<Pubkey, f64> {
+        let creators: Vec<Pubkey> = creator_of
+            .values()
+            .copied()
+            .collect::<HashSet<Pubkey>>()
+            .into_iter()
+            .collect();
+        let mut pots: HashMap<Pubkey, f64> = HashMap::new();
+        for chunk in creators.chunks(100) {
+            let keys: Vec<String> = chunk
+                .iter()
+                .map(|cr| pumpfun::creator_vault(cr).to_string())
+                .collect();
+            let Ok(v) = self
+                .rpc
+                .raw(
+                    "getMultipleAccounts",
+                    serde_json::json!([keys, {"encoding":"base64"}]),
+                )
+                .await
+            else {
+                continue;
+            };
+            let vals = v["value"].as_array().cloned().unwrap_or_default();
+            for (cr, item) in chunk.iter().zip(vals.iter()) {
+                let lam = item["lamports"].as_u64().unwrap_or(0);
+                pots.insert(*cr, Self::pot_of(lam, rent));
+            }
+        }
+        pots
+    }
+
+    /// БЫСТРЫЙ ПЕРЕЧЁТ КОТЛОВ ВОТЧЛИСТА. 600 монет = шесть батчей, то есть
+    /// секунды, поэтому ходить можно часто — а именно это и решает тайминг:
+    /// воркер клеймит раз в 4-5 минут, и войти надо в котёл, который уже дорос.
+    ///
+    /// Прежний цикл вместо этого опрашивал `/api/vault` по одной монете (851 мс
+    /// каждая, 426 секунд на 500 монет) и мерил не пот, а процент от порога,
+    /// которого не существует.
+    pub async fn pot_refresh_loop(self: Arc<Self>) {
+        let every = std::time::Duration::from_secs(self.cfg.strategy.pot_scan_interval_secs.max(5));
+        loop {
+            tokio::time::sleep(every).await;
+            let map = self.watch_creators.lock().await.clone();
+            if map.is_empty() {
+                continue;
+            }
+            let started = std::time::Instant::now();
+            let rent = self.vault_rent().await;
+            let pots = self.read_pots(&map, rent).await;
+            let prev = self.pot_cache.lock().await.clone();
+            let now = std::time::Instant::now();
+            let mut fresh: HashMap<Pubkey, (f64, f64, std::time::Instant)> = HashMap::new();
+            for (mint, cr) in map.iter() {
+                let Some(pot) = pots.get(cr).copied() else {
+                    continue;
+                };
+                // Прирост котла в SOL/мин — признак живой торговли по монете.
+                let rate = prev
+                    .get(mint)
+                    .map(|(old, _, t)| {
+                        let mins = t.elapsed().as_secs_f64() / 60.0;
+                        if mins > 0.05 {
+                            (pot - old) / mins
+                        } else {
+                            0.0
+                        }
+                    })
+                    .unwrap_or(0.0);
+                fresh.insert(*mint, (pot, rate, now));
+            }
+            let best = fresh.values().map(|(p, _, _)| *p).fold(0.0f64, f64::max);
+            let growing = fresh.values().filter(|(_, r, _)| *r > 1e-9).count();
             info!(
-                "обход котлов: {} монет за {:.1}с, за порогом {ready}, РАСТУЩИХ {growing}",
+                "котлы вотчлиста: {} монет за {:.1}с, лучший {best:.4} SOL, растущих {growing}",
                 fresh.len(),
                 started.elapsed().as_secs_f64()
             );
             *self.pot_cache.lock().await = fresh;
-            tokio::time::sleep(every).await;
         }
     }
 
@@ -726,25 +899,30 @@ const ROUND_TRIP_COST: f64 = 0.026;
             info!("пул ATA ещё не прогрет — входы на паузе");
             return Ok(());
         }
-        let mut cands = self.oracle.candidates().await?;
+        // КАНДИДАТЫ — ИЗ ВОТЧЛИСТА ПОЛНОГО ОБХОДА БОРДЫ. Пустой вотчлист
+        // значит, что первый обход ещё не закончился. Откатываться на прежний
+        // источник (страницы «свежих») НЕЛЬЗЯ: это ровно тот список, который
+        // гарантированно не содержит цели.
+        let mut cands = { self.board.lock().await.clone() };
+        if cands.is_empty() {
+            info!("вотчлист борды ещё не собран — входы на паузе");
+            return Ok(());
+        }
         // РАНЖИРОВАНИЕ ПО КОТЛУ. Цикл ниже берёт ПЕРВОГО прошедшего кандидата,
-        // поэтому порядок списка и есть выбор позиции. Фоновый обход
-        // (pot_scan_loop) уже измерил заполнение котлов параллельно, так что
-        // здесь это стоит одного взятия мьютекса: ставим вперёд самые полные.
-        // Без него вход доставался случайной монете — котёл проверялся только
-        // у того кандидата, до которого дошла очередь.
+        // поэтому порядок списка и есть выбор позиции. Котёл здесь —
+        // РЕАЛЬНЫЙ пот в SOL из чейна, а не процент от выдуманного порога:
+        // заработок ограничен именно им (фис = пот × 0.675 × наша доля).
+        // Прирост котла — вторичный ключ: он отличает живую торговлю от
+        // стоячего остатка при равном поте.
         {
             let pots = self.pot_cache.lock().await;
             if !pots.is_empty() {
-                // Сначала РАСТУЩИЕ котлы, потом по заполнению. Стоячий котёл за
-                // порогом может висеть часами: воркер ходит пачками, а в пачку
-                // попадают живые монеты.
                 cands.sort_by(|a, b| {
-                    let ka = pots.get(&a.mint).map(|(f, _, r, _)| (*r > 1e-9, *f));
-                    let kb = pots.get(&b.mint).map(|(f, _, r, _)| (*r > 1e-9, *f));
-                    let ka = ka.unwrap_or((false, -1.0));
-                    let kb = kb.unwrap_or((false, -1.0));
-                    kb.0.cmp(&ka.0)
+                    let ka = pots.get(&a.mint).map(|(p, r, _)| (*p, *r)).unwrap_or((-1.0, 0.0));
+                    let kb = pots.get(&b.mint).map(|(p, r, _)| (*p, *r)).unwrap_or((-1.0, 0.0));
+                    kb.0
+                        .partial_cmp(&ka.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
                         .then(kb.1.partial_cmp(&ka.1).unwrap_or(std::cmp::Ordering::Equal))
                 });
             }
@@ -961,7 +1139,9 @@ const ROUND_TRIP_COST: f64 = 0.026;
     async fn run_position(&self, c: Candidate) -> Result<()> {
         let mint = c.mint;
         // Размер подбирается ниже, когда станут известны пот и чужой флоат.
-        let mut buy_lamports = (self.cfg.strategy.buy_sol * LAMPORTS_PER_SOL) as u64;
+        // `strategy.buy_sol` на него НЕ влияет: он остался только грубой
+        // оценкой для прескрина доли в tick_entries, где пот ещё не прочитан.
+        let buy_lamports: u64;
         // Баланс ДО сделки — основа честного PnL: разница с балансом после
         // закрытия включает вход, выход, все комиссии, tip и ренту ATA.
         let lamports_before = self.rpc.lamports(&self.payer.pubkey()).await.unwrap_or(0);
@@ -975,7 +1155,12 @@ const ROUND_TRIP_COST: f64 = 0.026;
         if pumpswap::is_graduated(&curve) {
             // Выпустившиеся монеты торгуются на pAMM — вне MVP (нужен нативный
             // билдер pAMM или маршрут через Jupiter). Для лоукап-фарма пропускаем.
-            info!("{mint}: уже выпустилась (pAMM) — пропуск в MVP");
+            info!("{mint}: уже выпустилась (pAMM) — пропуск в MVP (кулдаун {}s)",
+                  Self::NO_TEMPLATE_COOLDOWN_SECS);
+            self.no_template
+                .lock()
+                .await
+                .insert(mint, std::time::Instant::now());
             return Ok(());
         }
         let curve = curve.unwrap();
@@ -1002,150 +1187,117 @@ const ROUND_TRIP_COST: f64 = 0.026;
         let me = self.payer.pubkey();
         // OTC-монеты — Token-2022; берём реальную token-программу минта.
         let coin_tp = pumpfun::coin_token_program(&self.rpc, &mint).await;
+        // ───── КОТЁЛ, РАЗМЕР И ГЕЙТ ВХОДА — ЦЕЛИКОМ ИЗ ЧЕЙНА ─────
+        //
+        // Витрина OTC здесь больше не решает ничего, и это измерено:
+        // `floorSol` порогом выплаты не является (у большинства монет 0.002),
+        // порога 0.10 SOL не существует вовсе — воркер клеймит котёл при
+        // 0.003-0.009 SOL (медиана 0.0038, снято с истории creator-vault), а
+        // `waitingSol` отстаёт от чейна. Прежний гейт «котёл заполнен ≥150% от
+        // 0.10 SOL» требовал 0.15 SOL, тогда как ни одна монета из 67 714 на
+        // борде не имела даже 0.10 (максимум по всей борде 0.0942): он
+        // запрещал вход ВСЕГДА, при любой сортировке.
+        //
+        // Пот считаем сами: фисы создателя pump копятся на PDA
+        // `creator-vault`, их и клеймит воркер OTC, чтобы раздать холдерам.
+        // Рента аккаунта из пота ВЫЧИТАЕТСЯ — клейм её не забирает.
+        let rent = self.vault_rent().await;
+        let vault_pda = pumpfun::creator_vault(&creator);
+        let vault_lamports = self.rpc.lamports(&vault_pda).await.unwrap_or(0);
+        let pot_sol = Self::pot_of(vault_lamports, rent);
+        info!(
+            "{mint}: котёл {pot_sol:.6} SOL (на аккаунте {:.6}, рента {:.6} не забирается)",
+            vault_lamports as f64 / LAMPORTS_PER_SOL,
+            rent as f64 / LAMPORTS_PER_SOL
+        );
+
+        // ПОДБОР РАЗМЕРА ПОЗИЦИИ. Прибыль от позиции есть
+        //     net(buy) = pot × 0.675 × buy/(float+buy) − cost × buy
+        // где первое слагаемое насыщается, а второе растёт линейно. Максимум
+        // там, где производная ноль:
+        //     buy_opt = sqrt(pot × 0.675 × float / cost) − float
+        let sol_usd = self.sol_price_usd().await;
+        let float_sol = c.float_usd.unwrap_or(0.0) / sol_usd.max(1e-9);
+        // Вырожденный случай: чужой флоат измерен НУЛЁМ (конкурентов с открытым
+        // ATA нет). Тогда доля равна 100% при любом размере, издержки растут
+        // линейно, и формальный оптимум — минимум. Но снимок флоата сделан НА
+        // МОМЕНТ ВХОДА, а конкуренты открывают аккаунты своей же покупкой: к
+        // раздаче их станет больше. Поэтому берём не минимум, а заданный
+        // размер — запас на размытие дешевле потерянной доли.
+        let buy_sol_dyn = if float_sol <= 1e-9 {
+            self.cfg.strategy.default_buy_sol
+        } else {
+            let raw_opt = (pot_sol * Self::HOLDERS_CUT * float_sol / Self::ROUND_TRIP_COST)
+                .max(0.0)
+                .sqrt()
+                - float_sol;
+            raw_opt
+                .max(self.cfg.strategy.min_buy_sol)
+                .min(self.cfg.strategy.max_buy_sol)
+        };
+        let share_frac = if float_sol + buy_sol_dyn > 0.0 {
+            buy_sol_dyn / (float_sol + buy_sol_dyn)
+        } else {
+            1.0
+        };
+        buy_lamports = (buy_sol_dyn * LAMPORTS_PER_SOL) as u64;
+        // Ожидаемый фис из чейна. Храним до закрытия, чтобы сверить прогноз с
+        // фактом — без этого сверка собирается глазами по разным строкам лога.
+        let expected_reward_sol = pot_sol * Self::HOLDERS_CUT * share_frac;
+
+        // ЦЕНА КРУГА. 2.6% от позиции — замер по 17 живым round-trip (две
+        // комиссии pump по 1% плюс спред; средняя там −4.7%, берём лучшую как
+        // базу). Бюджет пролива добавляем ТОЛЬКО если гонка включена: при
+        // exit_spam_tps = 0 выход идёт дешёвым опросом и ничего не жжёт.
+        let spam_budget = if self.cfg.strategy.exit_spam_tps > 0 {
+            self.cfg.strategy.exit_spam_max_sol
+        } else {
+            0.0
+        };
+        let round_trip = buy_sol_dyn * Self::ROUND_TRIP_COST + spam_budget;
+        let ev_ratio = if round_trip > 1e-12 {
+            expected_reward_sol / round_trip
+        } else {
+            f64::INFINITY
+        };
+        info!(
+            "{mint}: РАЗМЕР {buy_sol_dyn:.3} SOL, чужой флоат {float_sol:.4} SOL → доля {:.0}%; \
+             ФИС ожидаем {expected_reward_sol:.4} SOL (пот {pot_sol:.4} × {:.1}% холдерам × доля); \
+             круг стоит {round_trip:.4} SOL → EV ×{ev_ratio:.2}",
+            share_frac * 100.0,
+            Self::HOLDERS_CUT * 100.0
+        );
+
+        // Порог ПЫЛИ: ниже этого реворд не продаётся вовсе и остаётся висеть
+        // в ATA мёртвым грузом.
+        if expected_reward_sol < self.cfg.strategy.min_expected_reward_sol {
+            info!(
+                "{mint}: фис {expected_reward_sol:.4} < порога пыли {:.4} SOL — скип",
+                self.cfg.strategy.min_expected_reward_sol
+            );
+            return Ok(());
+        }
+        // ГЛАВНЫЙ ГЕЙТ: фис обязан перекрывать круг с запасом. В логе сразу
+        // печатаем, какой котёл для этого нужен, чтобы не считать в голове.
+        if ev_ratio < self.cfg.strategy.min_ev_ratio {
+            let pot_needed = self.cfg.strategy.min_ev_ratio * round_trip
+                / (Self::HOLDERS_CUT * share_frac.max(1e-9));
+            info!(
+                "{mint}: EV ×{ev_ratio:.2} < min ×{:.2} — круг не окупится, скип \
+                 (при доле {:.0}% нужен котёл ≥{pot_needed:.4} SOL)",
+                self.cfg.strategy.min_ev_ratio,
+                share_frac * 100.0
+            );
+            return Ok(());
+        }
+        info!("{mint}: ВХОДИМ — котёл {pot_sol:.4} SOL, EV ×{ev_ratio:.2}");
+
+        // Защита от проскальзывания считается от ИТОГОВОГО размера. Раньше она
+        // считалась ДО подбора размера: при расхождении больше slippage_bps
+        // покупка падала бы на min_tokens, а при меньшем размере защиты не было
+        // вовсе.
         let tokens_out = curve.tokens_out_for_sol(buy_lamports);
         let min_tokens = tokens_out - tokens_out * self.cfg.strategy.slippage_bps / 10_000;
-
-        // Ожидаемый фис, посчитанный из чейна ДО входа. Храним, чтобы при
-        // закрытии сверить прогноз с фактом — без этого сверка собирается
-        // глазами по разным строкам лога и врёт.
-        let mut expected_reward_sol = 0.0f64;
-        // ── КОТЁЛ МОНЕТЫ: один бесплатный HTTP, два решения о входе ──
-        // Делаем ДО кэша coin_fee, потому что это решение про КАЖДЫЙ вход, а не
-        // про разовый скрейп: монета с закэшированными фисами всё равно обязана
-        // проходить проверку «раунд близко».
-        match self.oracle.vault(&mint.to_string()).await {
-            // Монета, ушедшая на AMM, торгуется не программой pump, поэтому скрейп
-            // coin_fee вернёт пусто — 31 RPC-вызов в мусор (а на free-RPC ещё и 429
-            // на остальные пути).
-            //
-            // ⚠️ Смотреть ТОЛЬКО на `graduated`. `curveExists` к этому НЕ относится:
-            // это наличие curve-ноги в котле, и у живых платящих монет оно сплошь
-            // false. Проверено на STOCKS — distributed 0.177 SOL на 2 холдера при
-            // `graduated:false, curveExists:false`, то есть условие с curve_exists
-            // отбрасывало ровно тех, на кого мы и охотимся.
-            Ok(v) if v.graduated => {
-                info!("{mint}: ушла на AMM (graduated) — скип без RPC-скрейпа (кулдаун {}s)",
-                      Self::NO_TEMPLATE_COOLDOWN_SECS);
-                self.no_template
-                    .lock()
-                    .await
-                    .insert(mint, std::time::Instant::now());
-                return Ok(());
-            }
-            Ok(v) => {
-                // КОТЁЛ ПУСТ → раунд в наш холд не придёт, и мы отсидим
-                // hold_max_secs только чтобы выйти по бейлу в минус. Монета может
-                // быть идеальной по капе/холдерам/истории выплат и всё равно быть
-                // убыточной ПРЯМО СЕЙЧАС. Фильтруем долей, а не абсолютом:
-                // floorSol у монет разный (видели 0.002 и 0.1).
-                let floor = v.payout_floor(self.cfg.strategy.payout_floor_sol);
-                let fill = v.fill_pct(self.cfg.strategy.payout_floor_sol);
-                if fill < self.cfg.strategy.min_vault_fill_pct {
-                    info!(
-                        "{mint}: котёл заполнен {fill:.1}% (нужно ≥{:.0}%, {:.4}/{floor:.4} SOL) — раунд не успеет, скип",
-                        self.cfg.strategy.min_vault_fill_pct, v.waiting_sol
-                    );
-                    // ⚠️ НЕ ставим кулдаун recent_trade: это «раунд не близко ПРЯМО
-                    // СЕЙЧАС», а не «мы только что торговали». Котёл наполняется за
-                    // минуты, и монета может подойти уже через тик. Кулдаун здесь
-                    // отравлял бы весь пул кандидатов: за пару минут все они ушли бы
-                    // в 120-секундный бан, и бот замолчал бы без причины.
-                    return Ok(());
-                }
-                // ФОРМУЛА КОТЛА ИЗ ЧЕЙНА. Фисы создателя pump копятся на PDA
-                // `creator-vault`, и именно их воркер OTC клеймит, а потом
-                // раздаёт холдерам. То есть пот можно посчитать САМОМУ, не
-                // дожидаясь, пока он проявится в их API, — а раннее знание и
-                // есть тот запас, на котором заходят за минуту до раздачи.
-                // Логируем обе величины рядом, чтобы сверить формулу на фактах.
-                // КОТЁЛ СЧИТАЕМ ИЗ ЧЕЙНА, а не берём с витрины OTC.
-                //
-                // Фисы создателя pump копятся на PDA `creator-vault`, и именно их
-                // воркер OTC клеймит и раздаёт холдерам. Сверка на живой монете
-                // 27.10.2026: API 0.154390 SOL против 0.155281 на чейне — чейн
-                // ВПЕРЕДИ на 0.00089. Их API догоняет, а мы можем знать пот
-                // раньше и опрашивать его так часто, как позволяет RPC.
-                //
-                // Отсюда ожидаемый фис считается целиком из чейна:
-                //     reward = pot × Self::HOLDERS_CUT × наша_доля
-                // где Self::HOLDERS_CUT = 0.675 (остальное: протокол 12.5%, desk pot
-                // 10%, выкупы 10% — подписано в самом интерфейсе монеты).
-                let pot_sol = {
-                    let vault_pda = pumpfun::creator_vault(&creator);
-                    let onchain = self.rpc.lamports(&vault_pda).await.unwrap_or(0) as f64
-                        / LAMPORTS_PER_SOL;
-                    if onchain > 0.0 {
-                        info!(
-                            "{mint}: котёл из чейна {onchain:.6} SOL (API показывал {:.6}, отставание {:+.6})",
-                            v.waiting_sol,
-                            onchain - v.waiting_sol
-                        );
-                        onchain
-                    } else {
-                        v.waiting_sol
-                    }
-                };
-                // ПОДБОР РАЗМЕРА ПОЗИЦИИ. Разобранный бот держит 1-2 SOL и, по
-                // его словам, «сам подбирает в зависимости от доли и холдеров».
-                // Это решается в одну строку: прибыль от позиции есть
-                //     net(buy) = pot × 0.675 × buy/(float+buy) − cost × buy
-                // где первое слагаемое насыщается, а второе растёт линейно.
-                // Максимум там, где производная ноль:
-                //     buy_opt = sqrt(pot × 0.675 × float / cost) − float
-                // На наших числах это даёт как раз 1-2 SOL и всегда
-                // положительный net — проверено таблицей по сетке pot/float.
-                let sol_usd = self.sol_price_usd().await;
-                let float_sol = c.float_usd.unwrap_or(0.0) / sol_usd.max(1e-9);
-                //
-                // Вырожденный случай: чужой флоат измерен НУЛЁМ (конкурентов с
-                // открытым ATA нет). Тогда доля равна 100% при любом размере,
-                // издержки растут линейно, и формальный оптимум — минимум. Но
-                // снимок флоата сделан НА МОМЕНТ ВХОДА, а конкуренты открывают
-                // аккаунты своей же покупкой: к раздаче их станет больше.
-                // Поэтому берём не минимум, а середину диапазона — запас на
-                // размытие дешевле потерянной доли.
-                let buy_sol_dyn = if float_sol <= 1e-9 {
-                    self.cfg.strategy.default_buy_sol
-                } else {
-                    let raw_opt = (pot_sol * Self::HOLDERS_CUT * float_sol
-                        / Self::ROUND_TRIP_COST)
-                        .max(0.0)
-                        .sqrt()
-                        - float_sol;
-                    raw_opt
-                        .max(self.cfg.strategy.min_buy_sol)
-                        .min(self.cfg.strategy.max_buy_sol)
-                };
-                let share_frac = if float_sol + buy_sol_dyn > 0.0 {
-                    buy_sol_dyn / (float_sol + buy_sol_dyn)
-                } else {
-                    1.0
-                };
-                buy_lamports = (buy_sol_dyn * LAMPORTS_PER_SOL) as u64;
-                info!(
-                    "{mint}: РАЗМЕР подобран {buy_sol_dyn:.3} SOL (пот {pot_sol:.4}, чужой флоат {float_sol:.4} SOL) → доля {:.0}%",
-                    share_frac * 100.0
-                );
-                let expected_reward = pot_sol * Self::HOLDERS_CUT * share_frac;
-                expected_reward_sol = expected_reward;
-                info!(
-                    "{mint}: ОЖИДАЕМЫЙ ФИС {expected_reward:.4} SOL (пот {pot_sol:.4} × {:.1}% холдерам × наша доля {:.0}%)",
-                    Self::HOLDERS_CUT * 100.0,
-                    share_frac * 100.0
-                );
-                if expected_reward < self.cfg.strategy.min_expected_reward_sol {
-                    info!(
-                        "{mint}: ожидаемый фис {expected_reward:.4} < min {:.4} SOL — не окупит round-trip, скип",
-                        self.cfg.strategy.min_expected_reward_sol
-                    );
-                    return Ok(());
-                }
-                info!("{mint}: котёл заполнен {fill:.1}% ({:.4}/{floor:.4} SOL) — раунд близко, входим",
-                      v.waiting_sol);
-            }
-            // Котёл не прочитался — не блокируем вход, идём дальше.
-            Err(_) => {}
-        }
 
         // coin_fee_A/B из свежей реальной buy/sell монеты (остальное деривируем).
         // Кэшируем per-coin: нет свежих buy/sell → монета не торгуется, фисов не
