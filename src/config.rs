@@ -292,6 +292,9 @@ pub struct StrategyConfig {
     /// должна уже быть под наблюдением.
     #[serde(default = "default_watchlist_size")]
     pub watchlist_size: usize,
+    /// Выбрасывать из отбора монеты с непустым `hook` (другая механика выплаты).
+    #[serde(default = "default_exclude_hooked")]
+    pub exclude_hooked_coins: bool,
     /// Границы ПОДБОРА размера позиции. Размер не фиксирован: он считается из
     /// пота и чужого флоата как buy_opt = sqrt(pot × 0.675 × float / cost) − float,
     /// то есть точка максимума net(buy). Разобранный бот держит 1-2 SOL и
@@ -420,6 +423,19 @@ fn default_board_sweep_interval_secs() -> u64 {
 fn default_board_sweep_concurrency() -> u32 {
     8
 }
+fn default_exclude_hooked() -> bool {
+    // ВКЛЮЧЕНО. Монета с `hook` платит не по правилам раздачи держателям, под
+    // которые написан весь бот, и ранжирование по размеру котла тянет такие
+    // монеты НАВЕРХ: их котлы жирные именно потому, что их игра не выплачивает.
+    //
+    // Замер 04.11.2026: верхушка борды по поту — это `hook: "koth"`
+    // (King of the Hill), winner-takes-all с окном 900с. Вся наша арифметика
+    // доли там бессмысленна, а `hold_max_secs` прямо ОТБИРАЕТ приз: продажа до
+    // конца раунда его аннулирует. Плюс сам хук никого не короновал с 20.10,
+    // то есть эти котлы недоступны в принципе.
+    true
+}
+
 fn default_watchlist_size() -> usize {
     600
 }

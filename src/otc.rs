@@ -46,6 +46,15 @@ pub struct OtcCoin {
     #[serde(default)]
     pub rewards: Option<OtcRewards>,
 
+    /// ИГРА, ПО КОТОРОЙ МОНЕТА ПЛАТИТ. Пусто = обычная раздача держателям, под
+    /// которую написан бот. `"koth"` = King of the Hill: там не доля, а
+    /// winner-takes-all (см. `hooks_of` в strategy.rs). Приходит ТОЛЬКО в
+    /// `/api/coins?mint=X`: в пагинации поля нет вообще — проверено 04.11.2026
+    /// на 26 760 записях списка, hook не встретился ни разу, при том что
+    /// per-mint запрос той же монеты его отдаёт.
+    #[serde(default, alias = "hook")]
+    pub hook: Option<String>,
+
     /// Накопленная доля держателей в SOL (в /api/coins НЕ приходит — оставлено
     /// на случай, если появится в другом эндпоинте).
     #[serde(

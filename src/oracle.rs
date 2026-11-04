@@ -53,7 +53,7 @@ pub struct Candidate {
 }
 
 pub struct Oracle {
-    otc: OtcClient,
+    pub(crate) otc: OtcClient,
     /// Сколько страниц борды тянуть (борда ~52k монет).
     pages: usize,
     page_size: usize,

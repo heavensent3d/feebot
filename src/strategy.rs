@@ -96,6 +96,9 @@ pub struct Bot {
     /// Рента аккаунта-котла в лампортах (0 = ещё не спрашивали). Клейм её не
     /// забирает, поэтому пот = lamports − рента.
     vault_rent_lamports: std::sync::atomic::AtomicU64,
+    /// mint -> hook ("koth" и т.п.), None = обычная раздача. Кэш на весь
+    /// процесс: хук у монеты не меняется, а запрос per-mint, в пагинации его нет.
+    hook_cache: Arc<Mutex<HashMap<Pubkey, Option<String>>>>,
     /// Когда последний раз печатали каждое сообщение «входы на паузе».
     /// Тик входа идёт каждые `poll_ms` (400 мс), поэтому без троттла пауза
     /// заливает журнал: на первом запуске это 300 строк за две минуты, в
@@ -138,6 +141,7 @@ impl Bot {
             watch_creators: Arc::new(Mutex::new(HashMap::new())),
             pot_cache: Arc::new(Mutex::new(HashMap::new())),
             vault_rent_lamports: std::sync::atomic::AtomicU64::new(0),
+            hook_cache: Arc::new(Mutex::new(HashMap::new())),
             pause_log: Arc::new(Mutex::new(HashMap::new())),
             ata_pool: Arc::new(AtaPool::new()),
             no_template: Arc::new(Mutex::new(HashMap::new())),
@@ -748,6 +752,105 @@ const ROUND_TRIP_COST: f64 = 0.026;
 
     /// Один полный обход борды: собрать вотчлист по РЕАЛЬНОМУ коту из чейна.
     /// Возвращает (монет на кривой, монет в вотчлисте, лучший пот в SOL).
+    /// ХУКИ монет пачкой, с кэшем на весь процесс.
+    ///
+    /// `hook` приходит ТОЛЬКО в `/api/coins?mint=X` — в пагинации его нет
+    /// (проверено на 26 760 записях списка). Поэтому один запрос на монету, но
+    /// результат кэшируется навсегда: игра у монеты не меняется.
+    ///
+    /// Ошибку запроса НЕ кэшируем и трактуем как «хука нет»: иначе одна
+    /// недоступность API вычистила бы весь вотчлист. Страховкой служит жёсткая
+    /// проверка в `run_position` — до покупки хук перепроверяется.
+    async fn hooks_of(&self, mints: &[Pubkey]) -> HashMap<Pubkey, Option<String>> {
+        let mut out: HashMap<Pubkey, Option<String>> = HashMap::new();
+        let mut need: Vec<Pubkey> = Vec::new();
+        {
+            let cache = self.hook_cache.lock().await;
+            for m in mints {
+                match cache.get(m) {
+                    Some(h) => {
+                        out.insert(*m, h.clone());
+                    }
+                    None => need.push(*m),
+                }
+            }
+        }
+        if need.is_empty() {
+            return out;
+        }
+        let mut set: tokio::task::JoinSet<(Pubkey, Option<Option<String>>)> =
+            tokio::task::JoinSet::new();
+        for m in need {
+            let otc = self.oracle.otc.clone();
+            set.spawn(async move {
+                let got = otc.coin_detail(&m.to_string()).await.ok().map(|c| {
+                    c.hook
+                        .map(|h| h.trim().to_string())
+                        .filter(|h| !h.is_empty())
+                });
+                (m, got)
+            });
+        }
+        let mut learned: Vec<(Pubkey, Option<String>)> = Vec::new();
+        while let Some(r) = set.join_next().await {
+            let Ok((m, got)) = r else { continue };
+            match got {
+                Some(h) => {
+                    out.insert(m, h.clone());
+                    learned.push((m, h));
+                }
+                None => {
+                    out.insert(m, None); // запрос не прошёл — не кэшируем
+                }
+            }
+        }
+        if !learned.is_empty() {
+            let mut cache = self.hook_cache.lock().await;
+            for (m, h) in learned {
+                cache.insert(m, h);
+            }
+        }
+        out
+    }
+
+    /// Выбросить из ранжированного списка монеты с хуком и оставить `want`
+    /// чистых. Идём сверху вниз пачками: хук стоит у единиц монет, но лежат
+    /// они ровно в верхушке по поту, поэтому проверять весь список не нужно.
+    async fn drop_hooked(&self, ranked: &mut Vec<(f64, Candidate)>, want: usize) -> usize {
+        const CHUNK: usize = 48;
+        let mut kept: Vec<(f64, Candidate)> = Vec::with_capacity(want);
+        let mut dropped = 0usize;
+        let mut shown = 0usize;
+        let mut idx = 0usize;
+        while kept.len() < want && idx < ranked.len() {
+            let end = (idx + CHUNK).min(ranked.len());
+            let slice: Vec<Pubkey> = ranked[idx..end].iter().map(|(_, c)| c.mint).collect();
+            let hooks = self.hooks_of(&slice).await;
+            for (pot, c) in ranked[idx..end].iter() {
+                if kept.len() >= want {
+                    break;
+                }
+                match hooks.get(&c.mint) {
+                    Some(Some(h)) => {
+                        dropped += 1;
+                        if shown < 5 {
+                            shown += 1;
+                            info!(
+                                "вотчлист: {}/{} с котлом {pot:.4} SOL выброшена — hook {h}, платит не по правилам раздачи",
+                                c.symbol,
+                                &c.mint.to_string()[..6]
+                            );
+                        }
+                    }
+                    _ => kept.push((*pot, c.clone())),
+                }
+            }
+            idx = end;
+        }
+        *ranked = kept;
+        dropped
+    }
+
     pub async fn sweep_board(&self) -> Result<(usize, usize, f64)> {
         let rent = self.vault_rent().await;
         let cands = self
@@ -809,7 +912,17 @@ const ROUND_TRIP_COST: f64 = 0.026;
             })
             .collect();
         ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        ranked.truncate(self.cfg.strategy.watchlist_size.max(1));
+        // 3б. ВЫБРАСЫВАЕМ МОНЕТЫ С ХУКОМ. Без этого верхушка вотчлиста состоит
+        //     из них: котёл у хуковой монеты жирный ИМЕННО потому, что её игра
+        //     не выплачивает (koth не короновал никого с 20.10.2026).
+        let want = self.cfg.strategy.watchlist_size.max(1);
+        if self.cfg.strategy.exclude_hooked_coins {
+            let dropped = self.drop_hooked(&mut ranked, want).await;
+            if dropped > 0 {
+                info!("вотчлист: выброшено монет с хуком {dropped}");
+            }
+        }
+        ranked.truncate(want);
         let best = ranked.first().map(|(p, _)| *p).unwrap_or(0.0);
         let kept = ranked.len();
 
@@ -1218,6 +1331,31 @@ const ROUND_TRIP_COST: f64 = 0.026;
     /// Полный цикл одной позиции: вход → спам-выход.
     async fn run_position(&self, c: Candidate) -> Result<()> {
         let mint = c.mint;
+        // ЖЁСТКИЙ ГЕЙТ ПО ХУКУ — последняя проверка перед деньгами.
+        //
+        // Вотчлист хуковые монеты уже не содержит, но между появлением монеты
+        // на борде и ближайшим обходом есть окно, а цена ошибки здесь — целая
+        // позиция, купленная по чужим правилам. Проверка идёт по кэшу, то есть
+        // почти всегда без запроса.
+        //
+        // 04.11.2026 мы так и купили `jV7eSr…`: отбор увидел самый жирный
+        // котёл борды (0.0936 SOL) и ноль конкурентов, а монета оказалась
+        // `hook: "koth"` — там выигрывает не доля, а наибольшая ОДНА покупка в
+        // окне 900с, и `hold_max_secs` сбросил бы позицию раньше конца раунда,
+        // сам аннулировав приз.
+        if self.cfg.strategy.exclude_hooked_coins {
+            if let Some(Some(h)) = self.hooks_of(&[mint]).await.get(&mint) {
+                info!(
+                    "{mint}: hook {h} — другая механика выплаты, не наша игра (кулдаун {}s)",
+                    Self::NO_TEMPLATE_COOLDOWN_SECS
+                );
+                self.no_template
+                    .lock()
+                    .await
+                    .insert(mint, std::time::Instant::now());
+                return Ok(());
+            }
+        }
         // Размер подбирается ниже, когда станут известны пот и чужой флоат.
         // `strategy.buy_sol` на него НЕ влияет: он остался только грубой
         // оценкой для прескрина доли в tick_entries, где пот ещё не прочитан.
