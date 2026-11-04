@@ -1614,7 +1614,9 @@ const ROUND_TRIP_COST: f64 = 0.026;
                 .map(|(_, g, _)| *g)
                 .unwrap_or(0.0)
         };
-        let hold_min = self.cfg.strategy.hold_max_secs as f64 / 60.0;
+        // Горизонт — до ближайшей раздачи, а не весь холд: выход гейтуется
+        // ПЕРВОЙ выплатой, и собираем мы котёл на её момент.
+        let hold_min = self.cfg.strategy.pot_growth_horizon_secs as f64 / 60.0;
         let pot_at_payout = pot_sol + pot_growth * hold_min;
         let expected_reward_sol = pot_at_payout * Self::HOLDERS_CUT * share_frac;
 
