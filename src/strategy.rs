@@ -13,6 +13,7 @@
 //!    не выполнено, tx падает на ассерте и ничего не стоит (с durable nonce
 //!    nonce не расходуется). Это ровно та механика, что видно в ончейне.
 
+use crate::atapool::AtaPool;
 use crate::config::Config;
 use crate::filters::{Filters, Verdict};
 use crate::jupiter::Jupiter;
@@ -89,6 +90,11 @@ pub struct Bot {
     /// первый попавшийся.
     /// mint → (заполнение %, котёл SOL, прирост SOL/мин, когда измерено).
     pot_cache: Arc<Mutex<HashMap<Pubkey, (f64, f64, f64, std::time::Instant)>>>,
+    /// ПОСТОЯННО ОТКРЫТЫЕ ATA под reward-активы. Раздача аккаунтов не создаёт,
+    /// поэтому право на выплату нужно иметь ЗАРАНЕЕ, а не добывать транзакцией
+    /// перед покупкой. Пул же позволяет гейтовать вход: монета, под чей актив
+    /// аккаунта нет, отсеивается до всякого RPC.
+    ata_pool: Arc<AtaPool>,
 }
 
 impl Bot {
@@ -118,6 +124,7 @@ impl Bot {
             sol_price: Arc::new(Mutex::new((0.0, std::time::Instant::now()))),
             exit_registry: Arc::new(Mutex::new(HashMap::new())),
             pot_cache: Arc::new(Mutex::new(HashMap::new())),
+            ata_pool: Arc::new(AtaPool::new()),
             no_template: Arc::new(Mutex::new(HashMap::new())),
             coin_fees: Arc::new(Mutex::new(HashMap::new())),
             curve_to_mint: Arc::new(Mutex::new(HashMap::new())),
@@ -297,51 +304,84 @@ const ROUND_TRIP_COST: f64 = 0.026;
             .map(|bd| bd.float_usd)
     }
 
-    /// Открыть ATA под ВСЕ активы линейки реворда, которых у нас ещё нет.
+    /// Доступ к пулу ATA (инсинератору — чтобы он не сжёг наше право на выплату).
+    pub fn ata_pool(&self) -> Arc<AtaPool> {
+        Arc::clone(&self.ata_pool)
+    }
+
+    /// REWARD-АКТИВЫ БОРДЫ, ранжированные по приоритету, с весом «сколько монет
+    /// платят этим активом СЕЙЧАС». Только HTTP к борде, RPC не трогается.
     ///
-    /// Раздача НЕ создаёт ATA получателям — проверено на трёх подряд раздачах:
-    /// 12 получателей, все 12 уже имели ATA до транзакции, инструкций создания
-    /// ноль, только переводы Tokenkeg. Кто не открыл заранее — не получает
-    /// ничего. А линейка активов ротируется после каждой выплаты (в интерфейсе
-    /// это «REWARD LINEUP» с пометкой PAYING NOW), поэтому держать ATA только
-    /// под текущий актив недостаточно: заплатить могут следующим.
-    ///
-    /// Отдельной транзакцией, а не внутри покупки: семь созданий ATA плюс buy
-    /// на 18 аккаунтов упираются в лимит аккаунтов транзакции.
-    async fn ensure_basket_atas(&self, basket: &[Pubkey]) -> usize {
-        let me = self.payer.pubkey();
-        let mut ixs: Vec<Instruction> = Vec::new();
-        for m in basket.iter().take(8) {
-            let tp = pumpfun::coin_token_program(&self.rpc, m).await;
-            let ata = pumpfun::ata_with(&me, m, &tp);
-            if matches!(self.rpc.account(&ata).await, Ok(Some(_))) {
-                continue; // уже есть
+    /// Вес в сортировке: текущий актив монеты считается вчетверо против членства
+    /// в корзине. Платят ТЕКУЩИМ (в интерфейсе он помечен PAYING NOW), а корзина
+    /// это страховка от ротации, которая случается уже после выплаты.
+    pub async fn reward_ranking(&self) -> Result<Vec<(Pubkey, u64)>> {
+        let cands = self.oracle.candidates().await?;
+        let mut now: HashMap<Pubkey, u64> = HashMap::new();
+        let mut inbasket: HashMap<Pubkey, u64> = HashMap::new();
+        for c in &cands {
+            *now.entry(c.reward_mint).or_insert(0) += 1;
+            for b in &c.reward_basket {
+                *inbasket.entry(*b).or_insert(0) += 1;
             }
-            ixs.push(
-                spl_associated_token_account::instruction::create_associated_token_account_idempotent(
-                    &me, &me, m, &tp,
-                ),
-            );
         }
-        if ixs.is_empty() {
-            return 0;
+        let mut ranked: Vec<(Pubkey, u64)> = now
+            .keys()
+            .chain(inbasket.keys())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .map(|m| (*m, *now.get(m).unwrap_or(&0)))
+            .collect();
+        ranked.sort_by_key(|(m, w)| {
+            let rank = w * 4 + inbasket.get(m).copied().unwrap_or(0);
+            (std::cmp::Reverse(rank), m.to_bytes())
+        });
+        Ok(ranked)
+    }
+
+    /// ПРОГРЕВ ПУЛА ATA. Раз в `ata_warm_interval_secs` берёт борду, считает,
+    /// какими активами платят монеты, и держит под верхушку этого списка
+    /// постоянно открытые аккаунты.
+    ///
+    /// Почему не открывать перед покупкой (как было): создание ATA в горячем
+    /// пути это лишняя транзакция ровно в момент гонки, а если она не
+    /// приземлится, мы входим в позицию, по которой нам не заплатят. Активов на
+    /// всю борду ~240, рента возвратная, так что дешевле держать их открытыми
+    /// всегда: 0.25 SOL залога покрывают 99.8% монет.
+    ///
+    /// Вес актива: текущий reward-актив монеты весит вчетверо против членства в
+    /// корзине. Платят ТЕКУЩИМ (в интерфейсе это PAYING NOW), а корзина это лишь
+    /// страховка от ротации, которая случается после выплаты.
+    pub async fn ata_warm_loop(self: Arc<Self>) {
+        let every =
+            std::time::Duration::from_secs(self.cfg.strategy.ata_warm_interval_secs.max(60));
+        loop {
+            match self.reward_ranking().await {
+                Ok(ranked) => {
+                    match self
+                        .ata_pool
+                        .refresh(
+                            &self.rpc,
+                            &self.payer,
+                            &ranked,
+                            self.cfg.strategy.ata_rent_budget_sol,
+                            self.cfg.strategy.max_buy_sol + 0.05,
+                            self.cfg.strategy.sell_cu_price.max(1_000),
+                            self.cfg.strategy.dry_run,
+                        )
+                        .await
+                    {
+                        Ok(st) => info!(
+                            "ПУЛ ATA: открыто {}/{} активов (создано за проход {}), рента {:.3} SOL, покрытие борды {:.1}%",
+                            st.open, st.target, st.created, st.rent_locked_sol, st.coverage_pct
+                        ),
+                        Err(e) => warn!("прогрев ATA: {e:#}"),
+                    }
+                }
+                Err(e) => warn!("прогрев ATA: борда недоступна ({e})"),
+            }
+            tokio::time::sleep(every).await;
         }
-        let n = ixs.len();
-        if self.cfg.strategy.dry_run {
-            info!("[DRY] открыл бы {n} ATA под линейку реворда");
-            return n;
-        }
-        let mut all: Vec<Instruction> =
-            compute_budget(200_000, self.cfg.strategy.sell_cu_price).to_vec();
-        all.extend(ixs);
-        match self.rpc.latest_blockhash().await {
-            Ok(bh) => match self.relays.broadcast_build(&self.payer, &all, bh, &no_alts(), &[]).await {
-                Ok(sig) => info!("открыто {n} ATA под линейку реворда: {sig}"),
-                Err(e) => warn!("не открыть ATA линейки ({e}) — можем не попасть в раздачу"),
-            },
-            Err(e) => warn!("нет blockhash для ATA линейки: {e}"),
-        }
-        n
     }
 
     /// ФОНОВЫЙ ОБХОД КОТЛОВ. Тянет борду и опрашивает `/api/vault` по всем
@@ -428,6 +468,13 @@ const ROUND_TRIP_COST: f64 = 0.026;
         if self.slots.available_permits() == 0 {
             return Ok(());
         }
+        // Пул ATA ещё не прогрет → права на выплату у нас нет ни по одной
+        // монете. Покупать в таком состоянии значит гарантированно заплатить
+        // round-trip и не получить фис.
+        if !self.ata_pool.warmed() {
+            info!("пул ATA ещё не прогрет — входы на паузе");
+            return Ok(());
+        }
         let mut cands = self.oracle.candidates().await?;
         // РАНЖИРОВАНИЕ ПО КОТЛУ. Цикл ниже берёт ПЕРВОГО прошедшего кандидата,
         // поэтому порядок списка и есть выбор позиции. Фоновый обход
@@ -471,6 +518,7 @@ const ROUND_TRIP_COST: f64 = 0.026;
         // этом мы потеряли время на первом боевом запуске.
         let total = cands.len();
         let (mut sk_active, mut sk_cooldown, mut sk_rounds, mut sk_notpl) = (0, 0, 0, 0);
+        let mut sk_noata = 0usize;
         let (mut sk_pre1, mut sk_pre2, mut sk_float, mut sk_eval, mut sk_rmint) = (0, 0, 0, 0, 0);
         // Копим ПРИЧИНЫ отказа: номер этапа мало что говорит, тюнить можно только
         // по конкретному условию, которое режет.
@@ -499,6 +547,14 @@ const ROUND_TRIP_COST: f64 = 0.026;
                         continue;
                     }
                 }
+            }
+            // ПРАВО НА ВЫПЛАТУ. Раздача не создаёт получателям ATA, поэтому
+            // монета, под чей текущий reward-актив у нас аккаунта нет, бесполезна
+            // при любой доле: фис уйдёт мимо. Проверка из памяти, поэтому стоит
+            // первой — она снимает кандидата до единого обращения к RPC.
+            if !self.ata_pool.is_ready(&c.reward_mint).await {
+                sk_noata += 1;
+                continue;
             }
             // ГЛАВНЫЙ гейт модели: монета должна АКТИВНО раундиться (иначе раунд не
             // придёт, пока держим — именно на этом бот сливал). Дёшево, из памяти.
@@ -633,7 +689,7 @@ const ROUND_TRIP_COST: f64 = 0.026;
             // Говорим ВСЛУХ, почему ни один кандидат не подошёл.
             info!(
                 "tick: из {total} кандидатов не подошёл никто — отсев: держим {sk_active}, \
-                 кулдаун {sk_cooldown}, нет раундов {sk_rounds}, нет шаблона {sk_notpl}, \
+                 кулдаун {sk_cooldown}, нет ATA под актив {sk_noata}, нет раундов {sk_rounds}, нет шаблона {sk_notpl}, \
                  прескрин {sk_pre1}, реворды {sk_pre2}, флоат {sk_float}, EV {sk_eval}, \
                  сток занят {sk_rmint}"
             );
@@ -789,13 +845,26 @@ const ROUND_TRIP_COST: f64 = 0.026;
                 // положительный net — проверено таблицей по сетке pot/float.
                 let sol_usd = self.sol_price_usd().await;
                 let float_sol = c.float_usd.unwrap_or(0.0) / sol_usd.max(1e-9);
-                let raw_opt = (pot_sol * Self::HOLDERS_CUT * float_sol / Self::ROUND_TRIP_COST)
-                    .max(0.0)
-                    .sqrt()
-                    - float_sol;
-                let buy_sol_dyn = raw_opt
-                    .max(self.cfg.strategy.min_buy_sol)
-                    .min(self.cfg.strategy.max_buy_sol);
+                //
+                // Вырожденный случай: чужой флоат измерен НУЛЁМ (конкурентов с
+                // открытым ATA нет). Тогда доля равна 100% при любом размере,
+                // издержки растут линейно, и формальный оптимум — минимум. Но
+                // снимок флоата сделан НА МОМЕНТ ВХОДА, а конкуренты открывают
+                // аккаунты своей же покупкой: к раздаче их станет больше.
+                // Поэтому берём не минимум, а середину диапазона — запас на
+                // размытие дешевле потерянной доли.
+                let buy_sol_dyn = if float_sol <= 1e-9 {
+                    self.cfg.strategy.default_buy_sol
+                } else {
+                    let raw_opt = (pot_sol * Self::HOLDERS_CUT * float_sol
+                        / Self::ROUND_TRIP_COST)
+                        .max(0.0)
+                        .sqrt()
+                        - float_sol;
+                    raw_opt
+                        .max(self.cfg.strategy.min_buy_sol)
+                        .min(self.cfg.strategy.max_buy_sol)
+                };
                 let share_frac = if float_sol + buy_sol_dyn > 0.0 {
                     buy_sol_dyn / (float_sol + buy_sol_dyn)
                 } else {
@@ -857,18 +926,13 @@ const ROUND_TRIP_COST: f64 = 0.026;
                 }
             },
         };
-        // ATA под ВСЮ линейку реворда — до покупки. Раздача их не создаёт, а
-        // платить могут следующим активом в ротации.
-        if !c.reward_basket.is_empty() {
-            self.ensure_basket_atas(&c.reward_basket).await;
-        }
-
-        // ATA мемкоина и ATA reward-стока — КАЖДЫЙ под своей token-программой.
+        // ATA мемкоина — под своей token-программой. ATA reward-актива тут
+        // БОЛЬШЕ НЕ СОЗДАЁТСЯ: его держит постоянно открытым пул (ata_warm_loop),
+        // и гейт входа не пропускает монету, под чей актив аккаунта нет. Это
+        // убирает из горячего пути и транзакцию, и четыре аккаунта в самой
+        // покупке — тем легче ей приземлиться в гонке.
         let coin_ata_ix = spl_associated_token_account::instruction::create_associated_token_account_idempotent(
             &me, &me, &mint, &coin_tp,
-        );
-        let reward_ata_ix = spl_associated_token_account::instruction::create_associated_token_account_idempotent(
-            &me, &me, &c.reward_mint, &reward_tp,
         );
         // BUY полностью из деривации (18 аккаунтов) + coin_fee. Сверено байт-в-байт.
         let buy_ix = pumpfun::build_buy_exact(&me, &mint, &creator, &coin_tp, &fees, buy_lamports, min_tokens);
@@ -887,7 +951,7 @@ const ROUND_TRIP_COST: f64 = 0.026;
         }
         // Tip добавляет relay под конкретный эндпоинт.
         ixs.extend(compute_budget(self.cfg.strategy.buy_cu_limit, self.cfg.strategy.buy_cu_price));
-        ixs.extend([coin_ata_ix, reward_ata_ix, buy_ix]);
+        ixs.extend([coin_ata_ix, buy_ix]);
 
         if self.cfg.strategy.dry_run {
             info!(

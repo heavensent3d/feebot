@@ -39,7 +39,12 @@ impl Incinerator {
     /// Найти закрываемые аккаунты и собрать close-инструкции (не больше
     /// max_per_run). Стоки (Token-2022) сюда не попадают по определению —
     /// сканим только классическую token-программу.
-    pub async fn plan(&self, rpc: &Rpc, owner: &Pubkey) -> Result<Vec<Instruction>> {
+    pub async fn plan(
+        &self,
+        rpc: &Rpc,
+        owner: &Pubkey,
+        protected: &HashSet<Pubkey>,
+    ) -> Result<Vec<Instruction>> {
         let accs = rpc.token_accounts(owner, &TOKEN_PROGRAM).await?;
         let mut ixs = Vec::new();
         for ta in accs {
@@ -47,6 +52,16 @@ impl Incinerator {
                 break;
             }
             if self.keep.contains(&ta.mint) {
+                continue;
+            }
+            // REWARD-АКТИВЫ НЕ ТРОГАЕМ НИКОГДА. Шапка модуля утверждала, что
+            // стоки живут только в Token-2022 и сюда не попадают, — это
+            // неверно: разобранная раздача шла целиком через Tokenkeg, то есть
+            // через классическую программу, которую инсинератор и сканирует.
+            // А пустой reward-ATA это не мусор, а ровно наше право на выплату:
+            // раздача аккаунтов не создаёт. Закрыв его за 0.002 SOL ренты, мы
+            // потеряли бы фис, за которым и ходим.
+            if protected.contains(&ta.mint) {
                 continue;
             }
             if self.cfg.only_zero_balance && ta.amount != 0 {

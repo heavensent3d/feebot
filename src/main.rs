@@ -4,6 +4,7 @@
 //! не шлёт. Сначала посмотри логи и сверь layout'ы pump.fun/Lighthouse с
 //! актуальным mainnet, и только потом выключай dry_run.
 
+mod atapool;
 mod config;
 mod filters;
 mod holders;
@@ -134,7 +135,25 @@ async fn main() -> Result<()> {
             bot.sell_rewards().await?;
         }
         Cmd::Burn => {
-            run_burn(&rpc, &relays, &payer, &Incinerator::new(inc_cfg), cfg.strategy.dry_run).await?;
+            // Ручной прожиг идёт без прогретого пула, поэтому список защищённых
+            // минтов берём прямо с борды: сжечь пустой reward-ATA значит отдать
+            // право на выплату за 0.002 SOL возвратной ренты.
+            let protect: std::collections::HashSet<_> = bot
+                .reward_ranking()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(m, _)| m)
+                .collect();
+            run_burn(
+                &rpc,
+                &relays,
+                &payer,
+                &Incinerator::new(inc_cfg),
+                &protect,
+                cfg.strategy.dry_run,
+            )
+            .await?;
         }
         Cmd::Shreds => {
             run_shreds_tail(cfg.shreds.clone()).await?;
@@ -334,6 +353,15 @@ async fn run_loops(
         tokio::spawn(async move { bot.pot_scan_loop().await });
     }
 
+    // 1в) ПРОГРЕВ ПУЛА ATA под reward-активы. Раздача аккаунтов не создаёт, так
+    //     что право на выплату нужно иметь заранее; пока пул не прогрет, входы
+    //     стоят. Он же служит гейтом: монета, под чей актив аккаунта нет,
+    //     отсеивается до всякого RPC.
+    {
+        let bot = Arc::clone(&bot);
+        tokio::spawn(async move { bot.ata_warm_loop().await });
+    }
+
     // 2) продажа наград раз в ~минуту
     {
         let bot = Arc::clone(&bot);
@@ -354,9 +382,11 @@ async fn run_loops(
         let relays = relays.clone();
         let payer = Arc::clone(&payer);
         let dry = bot.cfg.strategy.dry_run;
+        let pool = bot.ata_pool();
         tokio::spawn(async move {
             loop {
-                if let Err(e) = run_burn(&rpc, &relays, &payer, &inc, dry).await {
+                let protect = pool.protected_mints().await;
+                if let Err(e) = run_burn(&rpc, &relays, &payer, &inc, &protect, dry).await {
                     warn!("incinerator: {e:#}");
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(inc.interval_secs())).await;
@@ -419,10 +449,13 @@ async fn run_burn(
     relays: &RelaySet,
     payer: &Arc<solana_sdk::signature::Keypair>,
     inc: &Incinerator,
+    protected: &std::collections::HashSet<solana_sdk::pubkey::Pubkey>,
     dry_run: bool,
 ) -> Result<()> {
     let owner = payer.pubkey();
-    let ixs = inc.plan(rpc, &owner).await?;
+    // Минты reward-активов: их пустые ATA это право на выплату, а не мусор, и
+    // закрывать их нельзя (см. Incinerator::plan).
+    let ixs = inc.plan(rpc, &owner, protected).await?;
     if ixs.is_empty() {
         info!("инсинератор: нечего закрывать");
         return Ok(());
