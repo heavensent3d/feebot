@@ -276,8 +276,12 @@ impl AtaPool {
                 }
             };
             // Обычным RPC, а не через релеи-сендеры: это не гонка, тут не нужны
-            // ни tip, ни веер. Preflight ОСТАВЛЕН включённым — ошибку создания
-            // хочется видеть сразу, а не искать потом по нулевым сверкам.
+            // ни tip, ни веер. Preflight оставлен включённым — ошибку создания
+            // хочется видеть сразу, а не искать потом по нулевым сверкам, — но
+            // `preflightCommitment` ОБЯЗАН быть не строже того, на котором взят
+            // blockhash. Без него узел симулировал на finalized, свежего
+            // блокхэша ещё не знал и отбивал ВСЁ подряд `BlockhashNotFound`.
+            // Торговый путь этого не видел: там skipPreflight.
             match build_signed(payer, &all, bh, &[], &[])
                 .and_then(|tx| {
                     bincode::serialize(&tx).map_err(|e| anyhow::anyhow!("serialize: {e}"))
@@ -287,7 +291,11 @@ impl AtaPool {
                 Ok(wire) => match rpc
                     .raw(
                         "sendTransaction",
-                        serde_json::json!([wire, {"encoding":"base64","maxRetries":5}]),
+                        serde_json::json!([wire, {
+                            "encoding":"base64",
+                            "preflightCommitment":"processed",
+                            "maxRetries":5
+                        }]),
                     )
                     .await
                 {
