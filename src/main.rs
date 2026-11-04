@@ -89,6 +89,27 @@ enum Cmd {
         #[arg(long, default_value_t = 40)]
         limit: usize,
     },
+    /// Разовая покупка в монете (для хука koth: добить собственный раунд).
+    /// ТРАТИТ SOL. Без гейтов отбора и без выхода — только покупка.
+    BuyOnce {
+        #[arg(long)]
+        mint: String,
+        #[arg(long)]
+        sol: f64,
+        /// micro-lamports/CU. Гонки тут нет, поэтому по умолчанию дёшево.
+        #[arg(long, default_value_t = 200_000)]
+        cu_price: u64,
+    },
+    /// Разовая продажа ВСЕЙ позиции по монете (пара к buy-once). ТРАТИТ SOL.
+    SellOnce {
+        #[arg(long)]
+        mint: String,
+        /// Сколько SOL стоил вход — от него считается пол продажи (bail_floor_bps).
+        #[arg(long, default_value_t = 0.0)]
+        cost: f64,
+        #[arg(long, default_value_t = 200_000)]
+        cu_price: u64,
+    },
     /// Создать durable-nonce аккаунт (authority = кошелёк бота) для sign-once выхода.
     InitNonce,
     /// Отправить тестовое сообщение в Telegram (проверка подключения).
@@ -190,6 +211,14 @@ async fn main() -> Result<()> {
         }
         Cmd::Bench { iters } => {
             bench_relays(&rpc, &relays, &payer, iters).await?;
+        }
+        Cmd::BuyOnce { mint, sol, cu_price } => {
+            let m = solana_sdk::pubkey::Pubkey::from_str(&mint)?;
+            bot.buy_once(&m, sol, cu_price).await?;
+        }
+        Cmd::SellOnce { mint, cost, cu_price } => {
+            let m = solana_sdk::pubkey::Pubkey::from_str(&mint)?;
+            bot.sell_once(&m, cost, cu_price).await?;
         }
         Cmd::InitNonce => {
             init_nonce(&rpc, &relays, &payer, cfg.strategy.dry_run).await?;

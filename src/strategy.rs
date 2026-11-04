@@ -1863,6 +1863,148 @@ const ROUND_TRIP_COST: f64 = 0.026;
         Ok((false, attempts, sell_amount))
     }
 
+    /// РАЗОВАЯ ПОКУПКА на заданную сумму: без отбора, без гейтов, без выхода.
+    ///
+    /// Нужна для хука `koth` («King of the Hill»), который живёт по другим
+    /// правилам, чем раздача холдерам: раунд там выигрывает НАИБОЛЬШАЯ ОДНА
+    /// покупка в окне 900 секунд, победитель обязан додержать ≥90% купленного
+    /// (`holdRatio`), и забирает он 67.5% котла целиком, а не долю. Замер
+    /// 04.11.2026: закрывает раунд не таймер, а СЛЕДУЮЩАЯ СДЕЛКА — на
+    /// `87aLG1z2…` клейм котла прошёл в ту же секунду, что и `kingAt`, а наше
+    /// собственное окно (18:20:33 → 18:35:33, единственный лидер, 100%
+    /// удержано) истекло без коронации, потому что после нас никто не купил.
+    ///
+    /// Торговый цикл такую покупку сделать НЕ МОЖЕТ и не должен: `entry_gate`
+    /// намеренно требует пустой ATA, чтобы веерные копии входа не купили
+    /// дважды. Здесь гейта нет именно потому, что монету мы уже держим, —
+    /// отсюда отдельная команда, а не флаг в стратегии.
+    pub async fn buy_once(&self, mint: &Pubkey, sol: f64, cu_price: u64) -> Result<()> {
+        let me = self.payer.pubkey();
+        let buy_lamports = (sol * LAMPORTS_PER_SOL) as u64;
+        anyhow::ensure!(buy_lamports > 0, "сумма покупки должна быть больше нуля");
+
+        let acc = self
+            .rpc
+            .account(&pumpfun::bonding_curve(mint))
+            .await?
+            .ok_or_else(|| anyhow!("нет аккаунта кривой у {mint}"))?;
+        let curve = pumpfun::parse_curve(&acc.data)?;
+        anyhow::ensure!(
+            !curve.complete,
+            "{mint} выпустилась с кривой — разовая покупка собрана под кривую, не под пул"
+        );
+        let creator = curve.creator;
+
+        let coin_tp = match pumpfun::coin_token_program(&self.rpc, mint).await {
+            Some(tp) => tp,
+            None => anyhow::bail!("не узнали token-программу монеты {mint} — покупка отменена"),
+        };
+        let fees = pumpfun::fetch_coin_fees(&self.rpc, mint).await?;
+
+        let tokens_out = curve.tokens_out_for_sol(buy_lamports);
+        let min_tokens = tokens_out - tokens_out * self.cfg.strategy.slippage_bps / 10_000;
+
+        let mut ixs: Vec<Instruction> = Vec::new();
+        // Приоритет задаётся аргументом, а не `buy_cu_price`: торговый вход
+        // платит 0.0006 SOL за место в гонке, а здесь гонки нет — на мёртвой
+        // монете мы единственный покупатель, и переплата была бы процентом
+        // от самой покупки.
+        ixs.extend(compute_budget(self.cfg.strategy.buy_cu_limit, cu_price));
+        ixs.push(
+            spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                &me, &me, mint, &coin_tp,
+            ),
+        );
+        ixs.push(pumpfun::build_buy_exact(
+            &me,
+            mint,
+            &creator,
+            &coin_tp,
+            &fees,
+            buy_lamports,
+            min_tokens,
+        ));
+
+        if self.cfg.strategy.dry_run {
+            info!("[DRY] BUY-ONCE {mint}: {sol:.4} SOL → ~{tokens_out} токенов (min_out {min_tokens})");
+            return Ok(());
+        }
+        let bh = self.rpc.latest_blockhash().await?;
+        let sig = self
+            .relays
+            .submit_primary(&self.payer, &ixs, bh, &no_alts(), &[])
+            .await?;
+        info!("BUY-ONCE {mint}: {sol:.4} SOL отправлено (min_out {min_tokens}), tx {sig}");
+        Ok(())
+    }
+
+    /// РАЗОВАЯ ПРОДАЖА всей позиции по монете. Пара к `buy_once`.
+    ///
+    /// Торговый цикл продаёт только то, во что сам вошёл в этом запуске: после
+    /// остановки бота позиция живёт на кошельке, а управляющего цикла у неё
+    /// больше нет. Восстановление позиции с кошелька не сделано (и не нужно
+    /// для разового случая), поэтому выход даётся отдельной командой.
+    ///
+    /// Пол продажи берём из `bail_floor_bps` относительно переданной цены
+    /// входа: без пола `min_sol_out = 0` и есть тот самый дамп в ноль, на
+    /// котором бот терял деньги раньше.
+    pub async fn sell_once(&self, mint: &Pubkey, cost_sol: f64, cu_price: u64) -> Result<()> {
+        let me = self.payer.pubkey();
+        let acc = self
+            .rpc
+            .account(&pumpfun::bonding_curve(mint))
+            .await?
+            .ok_or_else(|| anyhow!("нет аккаунта кривой у {mint}"))?;
+        let curve = pumpfun::parse_curve(&acc.data)?;
+        anyhow::ensure!(!curve.complete, "{mint} выпустилась с кривой — эта продажа только под кривую");
+        let creator = curve.creator;
+
+        let coin_tp = match pumpfun::coin_token_program(&self.rpc, mint).await {
+            Some(tp) => tp,
+            None => anyhow::bail!("не узнали token-программу монеты {mint} — продажа отменена"),
+        };
+        let ata = pumpfun::ata_with(&me, mint, &coin_tp);
+        let amount = self.rpc.token_amount(&ata).await.unwrap_or(0);
+        anyhow::ensure!(amount > 0, "на {ata} нет токенов — продавать нечего");
+
+        let spot = curve.sol_out_for_tokens(amount);
+        let floor = if cost_sol > 0.0 {
+            ((cost_sol * LAMPORTS_PER_SOL) as u128 * self.cfg.strategy.bail_floor_bps as u128 / 10_000) as u64
+        } else {
+            0
+        };
+        info!(
+            "SELL-ONCE {mint}: {amount} токенов, по кривой ~{:.4} SOL, пол {:.4} SOL",
+            spot as f64 / LAMPORTS_PER_SOL,
+            floor as f64 / LAMPORTS_PER_SOL
+        );
+        anyhow::ensure!(
+            spot >= floor,
+            "по кривой дают {:.4} SOL, это ниже пола {:.4} — продажа отменена",
+            spot as f64 / LAMPORTS_PER_SOL,
+            floor as f64 / LAMPORTS_PER_SOL
+        );
+
+        let fees = pumpfun::fetch_coin_fees(&self.rpc, mint).await?;
+        let mut ixs: Vec<Instruction> = Vec::new();
+        ixs.extend(compute_budget(self.cfg.strategy.sell_cu_limit, cu_price));
+        ixs.push(pumpfun::build_sell_derived(
+            &me, mint, &creator, &coin_tp, &fees, amount, floor,
+        ));
+
+        if self.cfg.strategy.dry_run {
+            info!("[DRY] SELL-ONCE {mint}: продал бы {amount} токенов, min_out {floor}");
+            return Ok(());
+        }
+        let bh = self.rpc.latest_blockhash().await?;
+        let sig = self
+            .relays
+            .submit_primary(&self.payer, &ixs, bh, &no_alts(), &[])
+            .await?;
+        info!("SELL-ONCE {mint}: отправлено, tx {sig}");
+        Ok(())
+    }
+
     /// Сколько SOL стоит начисленный реворд.
     ///
     /// Для WSOL котировка не нужна и ВРЕДНА: Jupiter на паре WSOL→WSOL отвечает
