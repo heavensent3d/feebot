@@ -70,6 +70,25 @@ enum Cmd {
         #[arg(long, default_value_t = 3)]
         iters: u32,
     },
+    /// Замерить, где на борде лежат заполненные котлы (только чтение).
+    Pots {
+        #[arg(long, default_value_t = 10)]
+        pages: usize,
+        #[arg(long, default_value_t = 50)]
+        size: usize,
+        /// Борда принимает РЕАЛЬНО только volume24h и marketCap; всё прочее =
+        /// её дефолтный порядок.
+        #[arg(long, default_value = "fresh")]
+        sort: String,
+    },
+    /// Снять с чейна НАСТОЯЩИЙ порог клейма по истории котла (только чтение).
+    Claims {
+        /// Минты через запятую.
+        #[arg(long)]
+        mints: String,
+        #[arg(long, default_value_t = 40)]
+        limit: usize,
+    },
     /// Создать durable-nonce аккаунт (authority = кошелёк бота) для sign-once выхода.
     InitNonce,
     /// Отправить тестовое сообщение в Telegram (проверка подключения).
@@ -154,6 +173,17 @@ async fn main() -> Result<()> {
                 cfg.strategy.dry_run,
             )
             .await?;
+        }
+        Cmd::Pots { pages, size, sort } => {
+            bot.scan_pots(pages, size, &sort).await?;
+        }
+        Cmd::Claims { mints, limit } => {
+            let list: Vec<String> = mints
+                .split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect();
+            bot.scan_claims(&list, limit).await?;
         }
         Cmd::Shreds => {
             run_shreds_tail(cfg.shreds.clone()).await?;

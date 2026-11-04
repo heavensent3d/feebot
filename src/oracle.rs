@@ -113,10 +113,20 @@ impl Oracle {
 
     /// Снять борду (страницы по объёму — там, где реально копятся фисы) и собрать кандидатов.
     pub async fn candidates(&self) -> Result<Vec<Candidate>> {
-        let coins = self
-            .otc
-            .coins_sorted(self.pages, self.page_size, &self.sort)
-            .await?;
+        self.candidates_with(self.pages, self.page_size, &self.sort.clone())
+            .await
+    }
+
+    /// То же, но с явными параметрами выборки. Нужно для замеров: борда
+    /// принимает РЕАЛЬНО только два сорта (`volume24h` и `marketCap`), всё
+    /// остальное молча отдаёт дефолтный порядок, и это надо уметь сравнивать.
+    pub async fn candidates_with(
+        &self,
+        pages: usize,
+        size: usize,
+        sort: &str,
+    ) -> Result<Vec<Candidate>> {
+        let coins = self.otc.coins_sorted(pages, size, sort).await?;
         let mut out = Vec::new();
         for c in coins {
             let Ok(mint) = Pubkey::from_str(&c.mint) else {

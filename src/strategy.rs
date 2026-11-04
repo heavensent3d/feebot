@@ -309,6 +309,252 @@ const ROUND_TRIP_COST: f64 = 0.026;
         Arc::clone(&self.ata_pool)
     }
 
+    /// ЗАМЕР КОТЛОВ ПО БОРДЕ. Отвечает на один вопрос: где вообще лежат монеты
+    /// с заполненным котлом, если борда сортировать по котлу НЕ УМЕЕТ.
+    ///
+    /// Проверено 04.11.2026: из всех значений `sort` борда принимает ровно два —
+    /// `volume24h` и `marketCap`. Любое другое (в т.ч. наш `fresh`) она молча
+    /// отдаёт дефолтным порядком. Котла в списочном ответе нет вообще: там
+    /// только mint/name/symbol/image/createdAt/rewardMint/rewardBasket/
+    /// rewardCycle/category. Значит котёл надо мерить самому.
+    ///
+    /// Путь целиком батчевый и целиком из деривации, без per-coin запросов:
+    ///   mint -> bonding_curve(mint) -> creator (байты 49..81 аккаунта кривой)
+    ///        -> creator_vault(creator) -> lamports
+    /// 100 аккаунтов на запрос, то есть две батч-пачки на каждые 100 монет.
+    ///
+    /// ВАЖНО про `creator_vault`: он привязан к СОЗДАТЕЛЮ, а не к монете. Если
+    /// один создатель выпустил несколько монет, фисы копятся в ОДИН котёл, и
+    /// читать его «как котёл монеты» было бы завышением. Поэтому замер отдельно
+    /// считает, сколько монет приходится на одного создателя.
+    pub async fn scan_pots(&self, pages: usize, size: usize, sort: &str) -> Result<()> {
+        let cands = self.oracle.candidates_with(pages, size, sort).await?;
+        info!(
+            "ЗАМЕР КОТЛОВ: сорт={sort}, {pages} страниц по {size} -> монет {}",
+            cands.len()
+        );
+
+        // 1. Кривые батчами: оттуда creator и признак выпуска.
+        let mut rows_in: Vec<(Pubkey, String, Pubkey)> = Vec::new();
+        let mut complete = 0usize;
+        let mut unread = 0usize;
+        for chunk in cands.chunks(100) {
+            let keys: Vec<String> = chunk
+                .iter()
+                .map(|c| pumpfun::bonding_curve(&c.mint).to_string())
+                .collect();
+            let v = match self
+                .rpc
+                .raw(
+                    "getMultipleAccounts",
+                    serde_json::json!([keys, {"encoding":"base64"}]),
+                )
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("замер котлов: кривые не прочитались ({e})");
+                    unread += chunk.len();
+                    continue;
+                }
+            };
+            let vals = v["value"].as_array().cloned().unwrap_or_default();
+            for (c, item) in chunk.iter().zip(vals.iter()) {
+                let Some(b64) = item["data"][0].as_str() else {
+                    unread += 1;
+                    continue;
+                };
+                let Ok(raw) = B64.decode(b64) else {
+                    unread += 1;
+                    continue;
+                };
+                match pumpfun::parse_curve(&raw) {
+                    Ok(cv) => {
+                        if cv.complete {
+                            complete += 1;
+                        }
+                        rows_in.push((c.mint, c.symbol.clone(), cv.creator));
+                    }
+                    Err(_) => unread += 1,
+                }
+            }
+        }
+
+        // 2. Котёл на создателя (дедуплицируем: котёл один на создателя).
+        let creators: Vec<Pubkey> = rows_in
+            .iter()
+            .map(|(_, _, cr)| *cr)
+            .collect::<HashSet<Pubkey>>()
+            .into_iter()
+            .collect();
+        let mut pots: HashMap<Pubkey, f64> = HashMap::new();
+        for chunk in creators.chunks(100) {
+            let keys: Vec<String> = chunk
+                .iter()
+                .map(|cr| pumpfun::creator_vault(cr).to_string())
+                .collect();
+            let Ok(v) = self
+                .rpc
+                .raw(
+                    "getMultipleAccounts",
+                    serde_json::json!([keys, {"encoding":"base64"}]),
+                )
+                .await
+            else {
+                continue;
+            };
+            let vals = v["value"].as_array().cloned().unwrap_or_default();
+            for (cr, item) in chunk.iter().zip(vals.iter()) {
+                let lam = item["lamports"].as_u64().unwrap_or(0);
+                pots.insert(*cr, lam as f64 / LAMPORTS_PER_SOL);
+            }
+        }
+
+        // 3. Сколько монет на создателя — насколько котёл «общий».
+        let mut per_creator: HashMap<Pubkey, usize> = HashMap::new();
+        for (_, _, cr) in &rows_in {
+            *per_creator.entry(*cr).or_insert(0) += 1;
+        }
+        let shared: usize = per_creator.values().filter(|n| **n > 1).sum();
+        let max_coins = per_creator.values().copied().max().unwrap_or(0);
+
+        // 4. Распределение относительно НАШЕГО гейта входа.
+        let floor = self.cfg.strategy.payout_floor_sol.max(1e-9);
+        let gate = floor * self.cfg.strategy.min_vault_fill_pct / 100.0;
+        let mut rows: Vec<(f64, String, Pubkey, usize)> = rows_in
+            .iter()
+            .map(|(m, sym, cr)| {
+                (
+                    pots.get(cr).copied().unwrap_or(0.0),
+                    sym.clone(),
+                    *m,
+                    per_creator.get(cr).copied().unwrap_or(1),
+                )
+            })
+            .collect();
+        rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let n = rows.len().max(1);
+        let cnt = |t: f64| rows.iter().filter(|r| r.0 >= t).count();
+        info!(
+            "кривых прочитано {} (не прочиталось {unread}), выпустившихся {complete}; создателей {} (монет у одного максимум {max_coins}, монет с общим котлом {shared})",
+            rows_in.len(),
+            creators.len()
+        );
+        info!(
+            "котёл >= гейта {gate:.3} SOL: {} ({:.1}%) | >={floor:.2}: {} | >=0.05: {} | >=0.01: {} | ноль: {}",
+            cnt(gate),
+            cnt(gate) as f64 * 100.0 / n as f64,
+            cnt(floor),
+            cnt(0.05),
+            cnt(0.01),
+            rows.iter().filter(|r| r.0 <= 0.0).count()
+        );
+        let med = rows.get(rows.len() / 2).map(|r| r.0).unwrap_or(0.0);
+        info!(
+            "медиана котла {med:.4} SOL, максимум {:.4} SOL",
+            rows.first().map(|r| r.0).unwrap_or(0.0)
+        );
+        for (pot, sym, mint, coins) in rows.iter().take(20) {
+            info!("  {pot:.4} SOL  {sym:<10} {mint}  (монет у создателя: {coins})");
+        }
+        Ok(())
+    }
+
+    /// НАСТОЯЩИЙ ПОРОГ КЛЕЙМА, снятый с чейна, а не угаданный из `floorSol`.
+    ///
+    /// Клейм опустошает `creator-vault`, поэтому в транзакции клейма видно,
+    /// сколько в котле лежало ДО — то есть при каком накоплении воркер OTC
+    /// решает забирать фисы. Это ровно то число, на котором должен стоять гейт
+    /// входа: входить надо под клейм, а не под произвольный процент от
+    /// придуманного порога.
+    ///
+    /// Путь: mint -> bonding_curve -> creator -> creator_vault ->
+    /// getSignaturesForAddress -> транзакции, где баланс котла УПАЛ.
+    pub async fn scan_claims(&self, mints: &[String], limit: usize) -> Result<()> {
+        let mut all_drops: Vec<f64> = Vec::new();
+        for ms in mints {
+            let Ok(mint) = ms.parse::<Pubkey>() else {
+                warn!("не минт: {ms}");
+                continue;
+            };
+            let curve = pumpfun::bonding_curve(&mint);
+            let Ok(Some(acc)) = self.rpc.account(&curve).await else {
+                warn!("{ms}: кривая не читается");
+                continue;
+            };
+            let Ok(cv) = pumpfun::parse_curve(&acc.data) else {
+                warn!("{ms}: кривая не парсится");
+                continue;
+            };
+            let vault = pumpfun::creator_vault(&cv.creator);
+            let now_lam = self.rpc.lamports(&vault).await.unwrap_or(0);
+            let sigs = self
+                .rpc
+                .raw(
+                    "getSignaturesForAddress",
+                    serde_json::json!([vault.to_string(), {"limit": limit}]),
+                )
+                .await
+                .unwrap_or(serde_json::Value::Null);
+            let arr = sigs.as_array().cloned().unwrap_or_default();
+            info!(
+                "=== {ms} | котёл {vault} сейчас {:.6} SOL | транзакций котла {} ===",
+                now_lam as f64 / LAMPORTS_PER_SOL,
+                arr.len()
+            );
+            let mut drops = 0usize;
+            for s in arr.iter() {
+                let Some(sig) = s["signature"].as_str() else { continue };
+                let Ok(t) = self
+                    .rpc
+                    .raw(
+                        "getTransaction",
+                        serde_json::json!([sig, {"encoding":"json","maxSupportedTransactionVersion":0}]),
+                    )
+                    .await
+                else {
+                    continue;
+                };
+                let keys = t["transaction"]["message"]["accountKeys"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                let vs = vault.to_string();
+                let Some(idx) = keys.iter().position(|k| k.as_str() == Some(vs.as_str())) else {
+                    continue;
+                };
+                let pre = t["meta"]["preBalances"][idx].as_u64().unwrap_or(0) as f64
+                    / LAMPORTS_PER_SOL;
+                let post = t["meta"]["postBalances"][idx].as_u64().unwrap_or(0) as f64
+                    / LAMPORTS_PER_SOL;
+                if post < pre - 1e-9 {
+                    drops += 1;
+                    all_drops.push(pre);
+                    let when = t["blockTime"].as_i64().unwrap_or(0);
+                    info!(
+                        "  КЛЕЙМ в {when}: котёл был {pre:.6} -> стал {post:.6} (забрали {:.6} SOL)",
+                        pre - post
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            }
+            if drops == 0 {
+                info!("  клеймов в истории котла НЕТ");
+            }
+        }
+        if !all_drops.is_empty() {
+            all_drops.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let n = all_drops.len();
+            info!(
+                "ИТОГ по {n} клеймам: минимум {:.6} | медиана {:.6} | максимум {:.6} SOL",
+                all_drops[0],
+                all_drops[n / 2],
+                all_drops[n - 1]
+            );
+        }
+        Ok(())
+    }
+
     /// REWARD-АКТИВЫ БОРДЫ, ранжированные по приоритету, с весом «сколько монет
     /// платят этим активом СЕЙЧАС». Только HTTP к борде, RPC не трогается.
     ///
