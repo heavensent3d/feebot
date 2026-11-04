@@ -343,7 +343,11 @@ const ROUND_TRIP_COST: f64 = 0.026;
         // открыт ATA под reward-актив: раздача ATA не создаёт (проверено на
         // трёх раздачах — 12 получателей, все 12 с готовым ATA, ноль созданий).
         // Обычный флоат считал всех подряд и тем завышал знаменатель нашей доли.
-        let reward_tp = pumpfun::coin_token_program(&self.rpc, &c.reward_mint).await;
+        // Не узнали token-программу стока → НЕ считаем флоат по догадке: ATA
+        // под чужой программой не найдутся, флоат выйдет нулевым, а наша доля —
+        // ложными 100%. None здесь = «замера нет», и require_float_measure
+        // отправит монету в скип.
+        let reward_tp = pumpfun::coin_token_program(&self.rpc, &c.reward_mint).await?;
         if let Ok(bd) = crate::holders::eligible_float_usd(
             &self.rpc,
             &c.mint,
@@ -1248,7 +1252,15 @@ const ROUND_TRIP_COST: f64 = 0.026;
         // Token-2022 (GetAccountDataSize на чужом минте), и покупка не проходила.
         // Хуже того, от программы зависит АДРЕС ATA, то есть Lighthouse-гейт
         // сторожил бы несуществующий аккаунт и выход не сработал бы никогда.
-        let reward_tp = pumpfun::coin_token_program(&self.rpc, &c.reward_mint).await;
+        let reward_tp = match pumpfun::coin_token_program(&self.rpc, &c.reward_mint).await {
+            Some(tp) => tp,
+            None => {
+                anyhow::bail!(
+                    "не узнали token-программу reward-стока {} — вход отменён (догадка ломает адрес ATA и гейт выхода)",
+                    c.reward_mint
+                )
+            }
+        };
 
         // НАШ ATA под reward-сток. Гейт выхода смотрит именно на него:
         // «нам начислили сток» — безопасный сигнал, что раунд нас зачёл.
@@ -1261,8 +1273,13 @@ const ROUND_TRIP_COST: f64 = 0.026;
 
         // ───── ВХОД ─────
         let me = self.payer.pubkey();
-        // OTC-монеты — Token-2022; берём реальную token-программу минта.
-        let coin_tp = pumpfun::coin_token_program(&self.rpc, &mint).await;
+        // Token-программа САМОЙ МОНЕТЫ. Берём с минта и не угадываем: от неё
+        // зависит адрес нашего ATA, ATA кривой и аккаунт token_program в
+        // инструкции buy — ошибка здесь роняет покупку с IncorrectProgramId.
+        let coin_tp = match pumpfun::coin_token_program(&self.rpc, &mint).await {
+            Some(tp) => tp,
+            None => anyhow::bail!("не узнали token-программу монеты {mint} — вход отменён"),
+        };
         // ───── КОТЁЛ, РАЗМЕР И ГЕЙТ ВХОДА — ЦЕЛИКОМ ИЗ ЧЕЙНА ─────
         //
         // Витрина OTC здесь больше не решает ничего, и это измерено:

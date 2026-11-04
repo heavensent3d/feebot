@@ -102,10 +102,18 @@ pub fn ata_with(owner: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> Pubkey
 }
 
 /// Какая token-программа у минта (owner минт-аккаунта = Token или Token-2022).
-pub async fn coin_token_program(rpc: &Rpc, mint: &Pubkey) -> Pubkey {
+///
+/// `None` = НЕ УЗНАЛИ (RPC не ответил или аккаунта нет). Угадывать здесь нельзя,
+/// и это стоило нам пяти упавших покупок: прежняя версия при ошибке RPC молча
+/// возвращала Token-2022, а от программы зависит И адрес ATA, И аккаунт
+/// `token_program` в инструкции pump. Неверная догадка = `IncorrectProgramId`
+/// на входе (замер: 5 покупок × 0.0006 SOL), а в замере флоата — нулевой
+/// знаменатель и завышенная до 100% наша доля, то есть вход по ложному EV.
+/// Вызывающий обязан обработать None как «пропустить», а не как «наверное 2022».
+pub async fn coin_token_program(rpc: &Rpc, mint: &Pubkey) -> Option<Pubkey> {
     match rpc.account(mint).await {
-        Ok(Some(a)) => a.owner,
-        _ => TOKEN_2022_PROGRAM, // OTC-монеты — Token-2022 по умолчанию
+        Ok(Some(a)) => Some(a.owner),
+        _ => None,
     }
 }
 
