@@ -1788,14 +1788,35 @@ const ROUND_TRIP_COST: f64 = 0.026;
         }
 
         // ───── ВЫХОД (спам с гейтом, триггерится шредами) ─────
-        // Будим выход и по нашему ATA стока (нам начислили), и по минту монеты
-        // (её раунд в шред-потоке). Гейт на НАШ ATA — корректность.
+        //
+        // ЧТО СТОРОЖИТ ГЕЙТ. Не наш ATA, а reward-ATA ВОРКЕРА: перед раздачей
+        // воркер `2k5hrzuy…` покупает reward-токен свопом на Jupiter, и этот
+        // своп — предвестник выплаты. Разбор 61 выхода danek: 22 из 22 его
+        // продаж приземлились в ТОМ ЖЕ СЛОТЕ, что своп воркера, на 1-21
+        // позицию позже. Список получателей к этому моменту уже зафиксирован,
+        // поэтому монету можно сбросить до того, как выплата дойдёт.
+        //
+        // Гейт на нашем ATA опаздывает: сброс creator-vault в 45 случаях из 48
+        // случился ПОЗЖЕ его продажи, медиана +231 секунда.
+        let worker_reward_ata =
+            pumpfun::ata_with(&crate::programs::OTC_LAUNCHER_REWARDS, &c.reward_mint, &reward_tp);
+        let (gate_ata, gate_baseline) = if self.cfg.strategy.exit_gate_on_worker {
+            let b = self.rpc.token_amount(&worker_reward_ata).await.unwrap_or(0);
+            info!(
+                "{mint}: гейт выхода на reward-ATA воркера {worker_reward_ata} (база {b})"
+            );
+            (worker_reward_ata, b)
+        } else {
+            (our_reward_ata, reward_baseline)
+        };
         let notify = Arc::new(Notify::new());
+        self.register_exit(&gate_ata, &notify).await;
         self.register_exit(&our_reward_ata, &notify).await;
         self.register_exit(&mint, &notify).await;
         let r = self
-            .run_exit(&c, coin_tp, creator, &fees, reward_baseline, &our_reward_ata, &notify)
+            .run_exit(&c, coin_tp, creator, &fees, gate_baseline, &gate_ata, &notify)
             .await;
+        self.deregister_exit(&gate_ata, &notify).await;
         self.deregister_exit(&our_reward_ata, &notify).await;
         self.deregister_exit(&mint, &notify).await;
         // Позиция закрыта/сдались → снимаем маркер (no-op в dry, где не ставили).
