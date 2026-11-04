@@ -454,7 +454,16 @@ async fn run_loops(
         tokio::spawn(async move {
             loop {
                 let protect = pool.protected_mints().await;
-                if let Err(e) = run_burn(&rpc, &relays, &payer, &inc, &protect, dry).await {
+                // ПУСТОЙ СПИСОК ЗАЩИЩЁННЫХ = НЕ ЖЖЁМ. Цикл стартует
+                // одновременно с прогревом пула, и на первом же проходе
+                // защищать может быть ещё нечего. Пустой `protect` означал бы
+                // «закрыть все пустые reward-ATA», то есть снести ровно то
+                // право на выплату, ради которого пул и держится: раздача
+                // аккаунтов не создаёт, и восстановление стоит и ренты, и
+                // пропущенных входов.
+                if protect.is_empty() {
+                    warn!("инсинератор: пул ATA ещё не прогрет — проход пропущен");
+                } else if let Err(e) = run_burn(&rpc, &relays, &payer, &inc, &protect, dry).await {
                     warn!("incinerator: {e:#}");
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(inc.interval_secs())).await;
